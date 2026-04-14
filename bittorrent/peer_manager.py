@@ -231,14 +231,20 @@ class PeerManager:
                 self._pm.mark_missing(piece_index)
                 raise  # let _download_from_peer log it and close connection
 
+            # In end-game mode two workers may race on the same piece.
+            # Check before marking complete so stats are only updated once.
+            # This is safe: no await between the check and mark_complete, so
+            # no other coroutine can slip in between them.
+            already_complete = self._pm.is_complete_piece(piece_index)
             self._storage.write_piece(piece_index, data)
             self._pm.mark_complete(piece_index)
 
-            self._stats.pieces_complete += 1
-            self._stats.bytes_downloaded += len(data)
-            done, total = self._pm.progress()
-            log.info("Piece %d/%d complete (%.1f%%)", done, total,
-                     self._stats.percent)
+            if not already_complete:
+                self._stats.pieces_complete += 1
+                self._stats.bytes_downloaded += len(data)
+                done, total = self._pm.progress()
+                log.info("Piece %d/%d complete (%.1f%%)", done, total,
+                         self._stats.percent)
 
-            if on_progress:
-                await on_progress(self._stats)
+                if on_progress:
+                    await on_progress(self._stats)

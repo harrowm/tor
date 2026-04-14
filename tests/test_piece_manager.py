@@ -398,3 +398,126 @@ class TestPieceFractions:
         assert len(fracs) == 9
         # First 3 cells cover piece 0 (complete), rest cover pieces 1 and 2
         assert fracs[0] == 1.0
+
+
+# ---------------------------------------------------------------------------
+# End-game mode
+# ---------------------------------------------------------------------------
+
+def make_pm_eg(num_pieces: int, threshold: int) -> PieceManager:
+    """Make a PieceManager with a custom end_game_threshold for testing."""
+    return PieceManager(
+        num_pieces,
+        PIECE_LENGTH,
+        PIECE_LENGTH * num_pieces,
+        end_game_threshold=threshold,
+    )
+
+
+class TestEndGame:
+    # --- is_end_game ---
+
+    def test_not_end_game_when_all_missing(self):
+        pm = make_pm_eg(10, threshold=3)
+        assert pm.is_end_game() is False
+
+    def test_not_end_game_when_above_threshold(self):
+        pm = make_pm_eg(10, threshold=3)
+        # 6 pieces complete → 4 remaining > threshold 3
+        for i in range(6):
+            pm.mark_complete(i)
+        assert pm.is_end_game() is False
+
+    def test_end_game_at_threshold(self):
+        pm = make_pm_eg(10, threshold=3)
+        # 7 complete → exactly 3 remaining == threshold
+        for i in range(7):
+            pm.mark_complete(i)
+        assert pm.is_end_game() is True
+
+    def test_end_game_below_threshold(self):
+        pm = make_pm_eg(10, threshold=3)
+        # 9 complete → 1 remaining < threshold
+        for i in range(9):
+            pm.mark_complete(i)
+        assert pm.is_end_game() is True
+
+    def test_not_end_game_when_all_complete(self):
+        pm = make_pm_eg(5, threshold=3)
+        for i in range(5):
+            pm.mark_complete(i)
+        assert pm.is_end_game() is False
+
+    def test_end_game_counts_in_progress_as_remaining(self):
+        pm = make_pm_eg(10, threshold=3)
+        # 7 complete, 2 in-progress, 1 missing → 3 remaining
+        for i in range(7):
+            pm.mark_complete(i)
+        pm.mark_in_progress(7)
+        pm.mark_in_progress(8)
+        assert pm.is_end_game() is True
+
+    def test_default_threshold_is_20(self):
+        pm = PieceManager(100, PIECE_LENGTH, PIECE_LENGTH * 100)
+        for i in range(80):
+            pm.mark_complete(i)
+        # 20 remaining == default threshold → end-game
+        assert pm.is_end_game() is True
+        pm.mark_complete(80)
+        # 19 remaining < default threshold → still end-game
+        assert pm.is_end_game() is True
+
+    # --- next_piece in end-game returns IN_PROGRESS pieces ---
+
+    def test_next_piece_returns_in_progress_in_end_game(self):
+        pm = make_pm_eg(5, threshold=2)
+        # Complete 3 pieces, leave 2 in-progress → end-game active
+        for i in range(3):
+            pm.mark_complete(i)
+        pm.mark_in_progress(3)
+        pm.mark_in_progress(4)
+        # next_piece should return one of 3 or 4 (IN_PROGRESS, but end-game)
+        result = pm.next_piece()
+        assert result in (3, 4)
+
+    def test_next_piece_skips_in_progress_outside_end_game(self):
+        pm = make_pm_eg(10, threshold=2)
+        # Complete 4, mark 2 in-progress → 4 remaining > threshold 2 → no end-game
+        for i in range(4):
+            pm.mark_complete(i)
+        pm.mark_in_progress(4)
+        pm.mark_in_progress(5)
+        # Pieces 6-9 are MISSING; next_piece must return one of those, not 4 or 5
+        result = pm.next_piece()
+        assert result in (6, 7, 8, 9)
+
+    def test_next_piece_returns_none_when_all_in_progress_outside_end_game(self):
+        pm = make_pm_eg(5, threshold=2)
+        # Complete 2, mark 3 in-progress → 3 remaining > threshold 2 → no end-game
+        for i in range(2):
+            pm.mark_complete(i)
+        for i in range(2, 5):
+            pm.mark_in_progress(i)
+        assert pm.next_piece() is None
+
+    def test_next_piece_respects_bitfield_in_end_game(self):
+        pm = make_pm_eg(5, threshold=3)
+        for i in range(2):
+            pm.mark_complete(i)
+        pm.mark_in_progress(2)
+        pm.mark_in_progress(3)
+        pm.mark_in_progress(4)
+        # end-game is active (3 remaining == threshold)
+        # peer only has piece 4 (bitfield: 00001000 → \x08)
+        result = pm.next_piece(b"\x08")
+        assert result == 4
+
+    def test_end_game_threshold_zero_disables_end_game(self):
+        """threshold=0 means end-game is never triggered."""
+        pm = make_pm_eg(3, threshold=0)
+        pm.mark_complete(0)
+        pm.mark_complete(1)
+        pm.mark_in_progress(2)
+        # 1 remaining, but threshold=0 → end-game never active
+        assert pm.is_end_game() is False
+        assert pm.next_piece() is None

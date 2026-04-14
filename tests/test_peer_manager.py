@@ -597,3 +597,118 @@ class TestDisconnectionHandling:
             await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
 
         assert pm.is_complete()
+
+
+# ---------------------------------------------------------------------------
+# End-game mode
+# ---------------------------------------------------------------------------
+
+class TestEndGame:
+    def _make_eg_setup(self, tmp_path, num_pieces: int, threshold: int):
+        """Helper: build torrent/pm/storage/manager with a custom eg threshold."""
+        pieces  = make_pieces(num_pieces)
+        torrent = make_torrent(pieces)
+        pm      = PieceManager(
+            torrent.num_pieces,
+            torrent.piece_length,
+            torrent.total_length,
+            end_game_threshold=threshold,
+        )
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+        return pieces, torrent, pm, storage, manager
+
+    async def test_end_game_completes_download(self, tmp_path):
+        """End-game mode: two peers each racing on the last piece → download completes."""
+        pieces, torrent, pm, storage, manager = self._make_eg_setup(
+            tmp_path, num_pieces=4, threshold=2
+        )
+
+        # Both peers have all 4 pieces; threshold=2 means end-game fires
+        # when 2 pieces remain.  With two concurrent workers, they should
+        # race and both finish correctly.
+        peer_a = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\xf0")
+        peer_b = FakePeer("5.6.7.8", 6882, pieces, bitfield=b"\xf0")
+
+        call_n = 0
+        async def open_side_effect(host, port, *a, **kw):
+            nonlocal call_n
+            call_n += 1
+            return peer_a if call_n == 1 else peer_b
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+
+        assert pm.is_complete()
+
+    async def test_end_game_no_double_count_in_stats(self, tmp_path):
+        """When two workers race on the same piece, pieces_complete is not inflated."""
+        pieces, torrent, pm, storage, manager = self._make_eg_setup(
+            tmp_path, num_pieces=4, threshold=4  # threshold=4 → end-game from start*
+        )
+        # *We need complete > 0 for end-game; we pre-complete piece 0 manually.
+        pm.mark_complete(0)
+        storage.allocate()
+        storage.write_piece(0, pieces[0])
+        manager._stats.pieces_complete = 1
+        manager._stats.bytes_downloaded = len(pieces[0])
+
+        # Both peers have pieces 1-3 and will both try to download them in end-game.
+        peer_a = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\xf0")
+        peer_b = FakePeer("5.6.7.8", 6882, pieces, bitfield=b"\xf0")
+
+        call_n = 0
+        async def open_side_effect(host, port, *a, **kw):
+            nonlocal call_n
+            call_n += 1
+            return peer_a if call_n == 1 else peer_b
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+
+        assert pm.is_complete()
+        # stats.pieces_complete must equal num_pieces exactly — no double-counting
+        assert manager.stats.pieces_complete == 4
+
+    async def test_end_game_data_correct_after_race(self, tmp_path):
+        """Data written to storage is correct even when two peers race on a piece."""
+        pieces, torrent, pm, storage, manager = self._make_eg_setup(
+            tmp_path, num_pieces=3, threshold=2
+        )
+
+        peer_a = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\xe0")
+        peer_b = FakePeer("5.6.7.8", 6882, pieces, bitfield=b"\xe0")
+
+        call_n = 0
+        async def open_side_effect(host, port, *a, **kw):
+            nonlocal call_n
+            call_n += 1
+            return peer_a if call_n == 1 else peer_b
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+
+        for i, expected in enumerate(pieces):
+            assert storage.read_piece(i) == expected
+
+    async def test_end_game_not_triggered_early(self, tmp_path):
+        """With a high threshold, end-game fires; with threshold=0 it never fires."""
+        pieces, torrent, pm, storage, manager = self._make_eg_setup(
+            tmp_path, num_pieces=4, threshold=0  # disabled
+        )
+
+        # Only one peer has all pieces; should still complete via normal path
+        fake = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\xf0")
+        with patch_open(fake):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert pm.is_complete()

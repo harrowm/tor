@@ -39,15 +39,18 @@ class PieceManager:
         num_pieces: int,
         piece_length: int,
         total_length: int,
+        *,
+        end_game_threshold: int = 20,
     ) -> None:
         if num_pieces <= 0:
             raise ValueError(f"num_pieces must be positive, got {num_pieces}")
         if piece_length <= 0:
             raise ValueError(f"piece_length must be positive, got {piece_length}")
 
-        self._num_pieces   = num_pieces
-        self._piece_length = piece_length
-        self._total_length = total_length
+        self._num_pieces         = num_pieces
+        self._piece_length       = piece_length
+        self._total_length       = total_length
+        self._end_game_threshold = end_game_threshold
         self._state: list[PieceState] = [PieceState.MISSING] * num_pieces
 
         # peer availability: piece_index -> count of peers that have it
@@ -76,6 +79,20 @@ class PieceManager:
     def is_complete(self) -> bool:
         """True when every piece is COMPLETE."""
         return all(s == PieceState.COMPLETE for s in self._state)
+
+    def is_end_game(self) -> bool:
+        """True when so few pieces remain that we request them from multiple peers.
+
+        End-game activates only after at least one piece is complete AND the
+        number of remaining (non-COMPLETE) pieces is within the threshold.
+        Requiring at least one complete piece prevents end-game from firing at
+        the very start of a download on small-piece-count managers.
+        """
+        if self._end_game_threshold <= 0:
+            return False
+        complete  = sum(1 for s in self._state if s == PieceState.COMPLETE)
+        remaining = self._num_pieces - complete
+        return complete > 0 and 0 < remaining <= self._end_game_threshold
 
     def piece_state(self, piece_index: int) -> PieceState:
         self._check_index(piece_index)
@@ -170,9 +187,11 @@ class PieceManager:
         A piece is eligible if it is MISSING and (peer_bitfield is None or the
         peer has it).
         """
+        in_end_game = self.is_end_game()
         candidates = [
             i for i in range(self._num_pieces)
-            if self._state[i] == PieceState.MISSING
+            if (self._state[i] == PieceState.MISSING or
+                (in_end_game and self._state[i] == PieceState.IN_PROGRESS))
             and (peer_bitfield is None or _peer_has(peer_bitfield, i))
         ]
 
