@@ -60,32 +60,26 @@ Goal: parse a .torrent, announce to tracker, download one piece from one peer, v
 - [x] Project skeleton + uv setup
 - [x] `bencode.py` — decoder and encoder, fully tested (76/76)
 - [x] `torrent.py` — parse .torrent file, compute info_hash correctly (29/29)
-- [x] `tracker.py` — HTTP announce, parse compact peer list (46/46)
+- [x] `tracker.py` — HTTP + UDP (BEP 15) announce, parse compact peer list (84/84)
 - [x] `messages.py` — peer wire protocol encode/decode (64/64)
-- [x] `peer.py` — handshake, bitfield, piece download with block pipelining (31/31)
+- [x] `peer.py` — handshake, bitfield, piece download with block pipelining (35/35)
 - [x] `storage.py` — pre-alloc, random-access writes, multi-file spanning (23/23)
-- [x] `piece_manager.py` — state machine, sequential + rarest-first selection (47/47)
-- [x] `peer_manager.py` — async download orchestration, peer pool (13/13)
+- [x] `piece_manager.py` — state machine, sequential + rarest-first + end-game selection (60/60)
+- [x] `peer_manager.py` — async download orchestration, peer pool, parallel download, end-game (26/26)
 - [x] `main.py` — CLI entry point (14/14)
 
-**Phase 0 complete — 343/343 tests passing.**
+**420/420 tests passing.**
 
-### Phase 1 — Full single-file download
-- Multiple peers via asyncio
-- Basic piece selection (sequential first, rarest-first later)
-- Disconnection / timeout handling
-
-### Phase 2 — Multi-file + robustness
-- Piece-to-file mapping
-- Pre-allocate file space
-- End-game mode
+### Phase 0 complete (MVP)
+### Phase 1 complete (parallel peers, disconnection/timeout handling)
+### Phase 2 end-game complete; multi-file/pre-alloc done in Phase 0
 
 ### Phase 3 — Choking + performance
 - Tit-for-tat choke/unchoke
 - Upload slots
 
 ### Phase 4 — Stretch goals
-- UDP tracker protocol (BEP 15)
+- [x] UDP tracker protocol (BEP 15)
 - DHT (BEP 5)
 - Magnet links (BEP 9 + BEP 10 extension protocol)
 - Seeding

@@ -11,12 +11,22 @@ Strategy:
 import struct
 import urllib.parse
 import pytest
+from unittest.mock import AsyncMock, patch
 
 from bittorrent.bencode import encode
 from bittorrent.tracker import (
     TrackerError,
     TrackerResponse,
+    _UDP_ANNOUNCE,
+    _UDP_CONNECT,
+    _UDP_ERROR,
+    _UDP_MAGIC,
+    _announce_udp,
     _build_url,
+    _decode_announce_response,
+    _decode_connect_response,
+    _encode_announce_request,
+    _encode_connect_request,
     _parse_compact_peers,
     _parse_dict_peers,
     _parse_response,
@@ -399,3 +409,278 @@ class TestAnnounce:
         with pytest.raises(TrackerError, match="HTTP request failed"):
             await announce("http://tracker.example.com/announce",
                            INFO_HASH, PEER_ID, 6881)
+
+    async def test_udp_url_routes_to_udp(self, monkeypatch):
+        """announce() dispatches UDP URLs to _announce_udp."""
+        expected = TrackerResponse(interval=900, peers=[("1.2.3.4", 6881)])
+        mock_udp = AsyncMock(return_value=expected)
+        monkeypatch.setattr("bittorrent.tracker._announce_udp", mock_udp)
+        result = await announce("udp://tracker.example.com:1337/announce",
+                                INFO_HASH, PEER_ID, 6881)
+        assert result is expected
+        mock_udp.assert_called_once()
+
+    async def test_http_url_does_not_route_to_udp(self, patch_session):
+        """announce() does NOT call _announce_udp for http:// URLs."""
+        peers = compact_peer("1.2.3.4", 6881)
+        patch_session(make_tracker_response(peers=peers))
+        # If _announce_udp were called it would fail (no mock), so this just
+        # verifies the HTTP path executes cleanly.
+        result = await announce("http://tracker.example.com/announce",
+                                INFO_HASH, PEER_ID, 6881)
+        assert isinstance(result, TrackerResponse)
+
+
+# ---------------------------------------------------------------------------
+# UDP packet encoding / decoding — pure functions
+# ---------------------------------------------------------------------------
+
+TX_ID       = 0xDEADBEEF
+CONN_ID     = 0x123456789ABCDEF0
+
+
+class TestEncodeConnectRequest:
+    def test_length(self):
+        pkt = _encode_connect_request(TX_ID)
+        assert len(pkt) == 16
+
+    def test_magic(self):
+        pkt = _encode_connect_request(TX_ID)
+        magic, = struct.unpack_from("!Q", pkt, 0)
+        assert magic == _UDP_MAGIC
+
+    def test_action_zero(self):
+        pkt = _encode_connect_request(TX_ID)
+        action, = struct.unpack_from("!I", pkt, 8)
+        assert action == _UDP_CONNECT
+
+    def test_transaction_id(self):
+        pkt = _encode_connect_request(TX_ID)
+        txid, = struct.unpack_from("!I", pkt, 12)
+        assert txid == TX_ID
+
+
+class TestDecodeConnectResponse:
+    def _make_response(self, action=_UDP_CONNECT, txid=TX_ID, conn_id=CONN_ID):
+        return struct.pack("!IIQ", action, txid, conn_id)
+
+    def test_returns_connection_id(self):
+        data = self._make_response()
+        assert _decode_connect_response(data, TX_ID) == CONN_ID
+
+    def test_short_data_raises(self):
+        with pytest.raises(TrackerError, match="too short"):
+            _decode_connect_response(b"\x00" * 15, TX_ID)
+
+    def test_wrong_action_raises(self):
+        data = self._make_response(action=99)
+        with pytest.raises(TrackerError, match="action"):
+            _decode_connect_response(data, TX_ID)
+
+    def test_txid_mismatch_raises(self):
+        data = self._make_response(txid=0xCAFEBABE)
+        with pytest.raises(TrackerError, match="transaction ID"):
+            _decode_connect_response(data, TX_ID)
+
+    def test_extra_bytes_ignored(self):
+        data = self._make_response() + b"\xff" * 10
+        assert _decode_connect_response(data, TX_ID) == CONN_ID
+
+
+class TestEncodeAnnounceRequest:
+    def _make(self, **kwargs):
+        return _encode_announce_request(
+            CONN_ID, TX_ID, INFO_HASH, PEER_ID, **kwargs
+        )
+
+    def test_length(self):
+        assert len(self._make()) == 98
+
+    def test_connection_id(self):
+        pkt = self._make()
+        conn_id, = struct.unpack_from("!Q", pkt, 0)
+        assert conn_id == CONN_ID
+
+    def test_action_one(self):
+        pkt = self._make()
+        action, = struct.unpack_from("!I", pkt, 8)
+        assert action == _UDP_ANNOUNCE
+
+    def test_transaction_id(self):
+        pkt = self._make()
+        txid, = struct.unpack_from("!I", pkt, 12)
+        assert txid == TX_ID
+
+    def test_info_hash_at_offset_16(self):
+        pkt = self._make()
+        assert pkt[16:36] == INFO_HASH
+
+    def test_peer_id_at_offset_36(self):
+        pkt = self._make()
+        assert pkt[36:56] == PEER_ID
+
+    def test_event_started_is_2(self):
+        pkt = self._make(event="started")
+        event_id, = struct.unpack_from("!I", pkt, 80)
+        assert event_id == 2
+
+    def test_event_stopped_is_3(self):
+        pkt = self._make(event="stopped")
+        event_id, = struct.unpack_from("!I", pkt, 80)
+        assert event_id == 3
+
+    def test_event_completed_is_1(self):
+        pkt = self._make(event="completed")
+        event_id, = struct.unpack_from("!I", pkt, 80)
+        assert event_id == 1
+
+    def test_event_empty_is_0(self):
+        pkt = self._make(event="")
+        event_id, = struct.unpack_from("!I", pkt, 80)
+        assert event_id == 0
+
+    def test_port_at_end(self):
+        pkt = self._make(port=51413)
+        port, = struct.unpack_from("!H", pkt, 96)
+        assert port == 51413
+
+
+class TestDecodeAnnounceResponse:
+    def _make_response(
+        self, action=_UDP_ANNOUNCE, txid=TX_ID, interval=1800,
+        leechers=5, seeders=10, peers=b""
+    ):
+        header = struct.pack("!IIIII", action, txid, interval, leechers, seeders)
+        return header + peers
+
+    def test_returns_tracker_response(self):
+        data = self._make_response()
+        result = _decode_announce_response(data, TX_ID)
+        assert isinstance(result, TrackerResponse)
+
+    def test_interval(self):
+        data = self._make_response(interval=900)
+        assert _decode_announce_response(data, TX_ID).interval == 900
+
+    def test_seeders_and_leechers(self):
+        data = self._make_response(leechers=3, seeders=7)
+        result = _decode_announce_response(data, TX_ID)
+        assert result.complete == 7
+        assert result.incomplete == 3
+
+    def test_peers_parsed(self):
+        peers_bytes = compact_peer("10.0.0.1", 6881)
+        data = self._make_response(peers=peers_bytes)
+        result = _decode_announce_response(data, TX_ID)
+        assert ("10.0.0.1", 6881) in result.peers
+
+    def test_multiple_peers(self):
+        peers_bytes = compact_peer("1.1.1.1", 1000) + compact_peer("2.2.2.2", 2000)
+        data = self._make_response(peers=peers_bytes)
+        result = _decode_announce_response(data, TX_ID)
+        assert len(result.peers) == 2
+
+    def test_short_data_raises(self):
+        with pytest.raises(TrackerError, match="too short"):
+            _decode_announce_response(b"\x00" * 19, TX_ID)
+
+    def test_wrong_action_raises(self):
+        data = self._make_response(action=99)
+        with pytest.raises(TrackerError, match="action"):
+            _decode_announce_response(data, TX_ID)
+
+    def test_error_action_raises(self):
+        # action=3 is UDP error response
+        header = struct.pack("!II", _UDP_ERROR, TX_ID)
+        data = header + b"torrent banned"
+        with pytest.raises(TrackerError, match="UDP tracker error"):
+            _decode_announce_response(data, TX_ID)
+
+    def test_txid_mismatch_raises(self):
+        data = self._make_response(txid=0x11111111)
+        with pytest.raises(TrackerError, match="transaction ID"):
+            _decode_announce_response(data, TX_ID)
+
+
+# ---------------------------------------------------------------------------
+# _announce_udp — integration (mocked _udp_transact)
+# ---------------------------------------------------------------------------
+
+class TestAnnounceUdp:
+    """Test the full connect+announce flow with _udp_transact mocked out."""
+
+    def _connect_resp(self, txid=None, conn_id=CONN_ID):
+        """Build a valid connect response (txid filled in at call time)."""
+        return lambda t: struct.pack("!IIQ", _UDP_CONNECT, t, conn_id)
+
+    def _announce_resp(self, txid=None, interval=1800, leechers=2, seeders=5, peers=b""):
+        header = struct.pack("!IIIII", _UDP_ANNOUNCE, txid or TX_ID,
+                             interval, leechers, seeders)
+        return header + peers
+
+    async def test_full_flow_returns_tracker_response(self, monkeypatch):
+        call_count = 0
+        stored_tx = {}
+
+        async def fake_transact(host, port, request, *, timeout):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                # Connect phase: extract transaction_id from request
+                txid, = struct.unpack_from("!I", request, 12)
+                stored_tx["connect"] = txid
+                return struct.pack("!IIQ", _UDP_CONNECT, txid, CONN_ID)
+            else:
+                # Announce phase: extract transaction_id
+                txid, = struct.unpack_from("!I", request, 12)
+                return struct.pack(
+                    "!IIIII", _UDP_ANNOUNCE, txid, 1800, 2, 5
+                ) + compact_peer("1.2.3.4", 6881)
+
+        monkeypatch.setattr("bittorrent.tracker._udp_transact", fake_transact)
+        result = await _announce_udp(
+            "udp://tracker.example.com:1337/announce",
+            INFO_HASH, PEER_ID, 6881,
+        )
+        assert isinstance(result, TrackerResponse)
+        assert result.interval == 1800
+        assert ("1.2.3.4", 6881) in result.peers
+        assert call_count == 2
+
+    async def test_invalid_url_raises(self):
+        with pytest.raises(TrackerError, match="Invalid UDP tracker URL"):
+            await _announce_udp("udp:///no-host", INFO_HASH, PEER_ID, 6881)
+
+    async def test_url_missing_port_raises(self):
+        with pytest.raises(TrackerError, match="Invalid UDP tracker URL"):
+            await _announce_udp("udp://tracker.example.com/announce",
+                                INFO_HASH, PEER_ID, 6881)
+
+    async def test_transact_error_propagates(self, monkeypatch):
+        async def fail_transact(*a, **kw):
+            raise TrackerError("DNS failure")
+
+        monkeypatch.setattr("bittorrent.tracker._udp_transact", fail_transact)
+        with pytest.raises(TrackerError, match="DNS failure"):
+            await _announce_udp(
+                "udp://tracker.example.com:1337/announce",
+                INFO_HASH, PEER_ID, 6881,
+            )
+
+    async def test_correct_host_and_port_used(self, monkeypatch):
+        calls = []
+
+        async def capturing_transact(host, port, request, *, timeout):
+            calls.append((host, port))
+            txid, = struct.unpack_from("!I", request, 12)
+            if len(calls) == 1:
+                return struct.pack("!IIQ", _UDP_CONNECT, txid, CONN_ID)
+            return struct.pack("!IIIII", _UDP_ANNOUNCE, txid, 900, 0, 0)
+
+        monkeypatch.setattr("bittorrent.tracker._udp_transact", capturing_transact)
+        await _announce_udp(
+            "udp://opentracker.example.org:6969/announce",
+            INFO_HASH, PEER_ID, 6881,
+        )
+        assert all(h == "opentracker.example.org" for h, _ in calls)
+        assert all(p == 6969 for _, p in calls)
