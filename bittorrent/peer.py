@@ -124,6 +124,8 @@ class PeerConnection:
             raise PeerError("Peer closed connection during handshake") from exc
         except asyncio.TimeoutError:
             raise PeerError("Handshake timed out")
+        except OSError as exc:
+            raise PeerError(f"Handshake failed: {exc}") from exc
 
         try:
             their_hash, their_id = decode_handshake(data)

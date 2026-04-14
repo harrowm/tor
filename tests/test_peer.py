@@ -166,6 +166,19 @@ class TestHandshake:
         with pytest.raises(PeerError):
             await peer._handshake(INFO_HASH, PEER_ID)
 
+    async def test_connection_reset_during_handshake_raises_peer_error(self):
+        """ConnectionResetError (OSError subclass) during handshake → PeerError."""
+        class ResetReader:
+            async def readexactly(self, n):
+                raise ConnectionResetError(54, "Connection reset by peer")
+
+        writer = MockWriter()
+        peer = PeerConnection("1.2.3.4", 6881)
+        peer._reader = ResetReader()
+        peer._writer = writer
+        with pytest.raises(PeerError, match="Handshake failed"):
+            await peer._handshake(INFO_HASH, PEER_ID)
+
     async def test_reads_bitfield_after_handshake(self):
         their_hs = encode_handshake(INFO_HASH, THEIR_ID)
         bf_bytes  = b"\xff\x80"
