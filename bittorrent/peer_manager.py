@@ -26,8 +26,9 @@ from bittorrent.torrent import Torrent
 
 log = logging.getLogger(__name__)
 
-MAX_PEERS      = 30    # maximum simultaneous connections
-CONNECT_TIMEOUT = 10.0  # seconds
+MAX_PEERS       = 30   # maximum simultaneous connections
+CONNECT_TIMEOUT = 10.0  # seconds to wait for a TCP connection
+STALL_WAIT      = 0.1   # seconds to wait when all remaining pieces are in-flight
 
 
 @dataclass
@@ -202,12 +203,23 @@ class PeerManager:
         conn: PeerConnection,
         on_progress: callable | None,
     ) -> None:
-        """Keep downloading pieces from *conn* until it has nothing we need."""
+        """Keep downloading pieces from *conn* until it has nothing we need.
+
+        When ``next_piece`` returns None but pieces are still IN_PROGRESS we
+        wait briefly and retry.  This prevents a worker from exiting and
+        consuming its peer just before another peer's in-flight piece fails and
+        returns to MISSING — which would leave no worker alive to pick it up.
+        """
         while not self._pm.is_complete():
             piece_index = self._pm.next_piece(conn.bitfield)
             if piece_index is None:
-                log.debug("Peer %s:%s has nothing we need", conn.host, conn.port)
-                return
+                if self._pm.num_in_progress == 0:
+                    # No MISSING pieces for this peer and nothing in-flight.
+                    log.debug("Peer %s:%s has nothing we need", conn.host, conn.port)
+                    return
+                # Pieces are in-flight; wait in case one fails back to MISSING.
+                await asyncio.sleep(STALL_WAIT)
+                continue
 
             self._pm.mark_in_progress(piece_index)
             piece_size = self._pm.piece_size(piece_index)

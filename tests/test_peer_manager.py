@@ -288,3 +288,312 @@ class TestConnectionFailure:
             await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
 
         assert pm.is_complete()
+
+
+# ---------------------------------------------------------------------------
+# Parallel download across multiple peers
+# ---------------------------------------------------------------------------
+
+class TestParallelDownload:
+    async def test_two_peers_each_with_half_the_pieces(self, tmp_path):
+        """Peer A has pieces 0-1, Peer B has pieces 2-3; combined = complete."""
+        pieces  = make_pieces(4)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        # \xc0 = 11000000 → pieces 0,1 ; \x30 = 00110000 → pieces 2,3
+        peer_a = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\xc0")
+        peer_b = FakePeer("5.6.7.8", 6882, pieces, bitfield=b"\x30")
+
+        async def open_side_effect(host, port, *a, **kw):
+            return peer_a if host == "1.2.3.4" else peer_b
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+
+        assert pm.is_complete()
+        assert pm.num_complete == 4
+
+    async def test_six_pieces_split_across_three_peers(self, tmp_path):
+        """Each of three peers has exactly two pieces; all six must be downloaded."""
+        pieces  = make_pieces(6)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        # \xc0 = pieces 0-1 ; \x30 = pieces 2-3 ; \x0c = pieces 4-5
+        peer_map = {
+            "1.1.1.1": FakePeer("1.1.1.1", 1, pieces, bitfield=b"\xc0"),
+            "2.2.2.2": FakePeer("2.2.2.2", 2, pieces, bitfield=b"\x30"),
+            "3.3.3.3": FakePeer("3.3.3.3", 3, pieces, bitfield=b"\x0c"),
+        }
+
+        async def open_side_effect(host, port, *a, **kw):
+            return peer_map[host]
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.1.1.1", 1), ("2.2.2.2", 2), ("3.3.3.3", 3)])
+
+        assert pm.is_complete()
+
+    async def test_correct_data_written_from_two_peers(self, tmp_path):
+        """Verify that pieces written to storage come from the correct peers."""
+        pieces  = make_pieces(4)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        peer_a = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\xc0")  # 0,1
+        peer_b = FakePeer("5.6.7.8", 6882, pieces, bitfield=b"\x30")  # 2,3
+
+        async def open_side_effect(host, port, *a, **kw):
+            return peer_a if host == "1.2.3.4" else peer_b
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+
+        for i, expected in enumerate(pieces):
+            assert storage.read_piece(i) == expected
+
+    async def test_no_piece_downloaded_twice(self, tmp_path):
+        """Under concurrent peers, no piece should be downloaded more than once."""
+        pieces  = make_pieces(4)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        download_counts: dict[int, int] = {i: 0 for i in range(4)}
+
+        class CountingPeer(FakePeer):
+            async def download_piece(self, idx, size, h):
+                download_counts[idx] += 1
+                return self._pieces[idx]
+
+        # Both peers have all 4 pieces (\xf0 = 11110000)
+        peer_a = CountingPeer("1.2.3.4", 6881, pieces, bitfield=b"\xf0")
+        peer_b = CountingPeer("5.6.7.8", 6882, pieces, bitfield=b"\xf0")
+
+        call_n = 0
+        async def open_side_effect(host, port, *a, **kw):
+            nonlocal call_n
+            call_n += 1
+            return peer_a if call_n == 1 else peer_b
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+
+        assert pm.is_complete()
+        for i, count in download_counts.items():
+            assert count == 1, f"piece {i} downloaded {count} times"
+
+    async def test_stall_wait_allows_in_flight_piece_recovery(self, tmp_path):
+        """Worker that finds no MISSING pieces waits for in-flight pieces to resolve.
+
+        Scenario:
+          - Peer A has piece 0 only.
+          - Peer B has piece 1 only, but fails immediately.
+          - Peer C has piece 1 only, succeeds.
+
+        Without the stall-wait fix, Worker A finishes piece 0, sees piece 1 is
+        IN_PROGRESS (not its bitfield), exits, grabs Peer C, but Peer C also
+        sees piece 1 as IN_PROGRESS and exits — leaving no worker when Peer B
+        fails.  With the fix, the worker waits until piece 1 resolves.
+        """
+        pieces  = make_pieces(2)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        from bittorrent.peer import PeerError
+
+        class FailPeer:
+            host     = "2.2.2.2"
+            port     = 2
+            bitfield = bytearray(b"\x40")  # piece 1
+
+            async def download_piece(self, idx, size, h):
+                await asyncio.sleep(0)   # yield so other tasks run first
+                raise PeerError("peer B failed")
+
+            async def close(self): pass
+
+        peer_map = {
+            "1.1.1.1": FakePeer("1.1.1.1", 1, pieces, bitfield=b"\x80"),  # piece 0
+            "2.2.2.2": FailPeer(),
+            "3.3.3.3": FakePeer("3.3.3.3", 3, pieces, bitfield=b"\x40"),  # piece 1
+        }
+
+        async def open_side_effect(host, port, *a, **kw):
+            return peer_map[host]
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.1.1.1", 1), ("2.2.2.2", 2), ("3.3.3.3", 3)])
+
+        assert pm.is_complete()
+
+
+# ---------------------------------------------------------------------------
+# Disconnection / timeout handling
+# ---------------------------------------------------------------------------
+
+class TestDisconnectionHandling:
+    async def test_piece_retried_after_peer_timeout(self, tmp_path):
+        """A peer that raises PeerError (simulating timeout) hands the piece to the next peer."""
+        pieces  = make_pieces(2)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        from bittorrent.peer import PeerError
+
+        class TimeoutPeer:
+            host     = "1.2.3.4"
+            port     = 6881
+            bitfield = bytearray(b"\xc0")  # pieces 0,1
+
+            async def download_piece(self, idx, size, h):
+                raise PeerError("simulated block timeout")
+
+            async def close(self): pass
+
+        good_peer = FakePeer("5.6.7.8", 6882, pieces, bitfield=b"\xc0")
+
+        call_n = 0
+        async def open_side_effect(host, port, *a, **kw):
+            nonlocal call_n
+            call_n += 1
+            return TimeoutPeer() if call_n == 1 else good_peer
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+
+        assert pm.is_complete()
+
+    async def test_in_progress_piece_returned_to_missing_on_timeout(self, tmp_path):
+        """After all peers are exhausted, a failed piece is MISSING not IN_PROGRESS."""
+        pieces  = make_pieces(1)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        from bittorrent.peer import PeerError
+
+        class TimeoutPeer:
+            host     = "1.2.3.4"
+            port     = 6881
+            bitfield = bytearray(b"\x80")
+
+            async def download_piece(self, idx, size, h):
+                raise PeerError("timeout")
+
+            async def close(self): pass
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(return_value=TimeoutPeer()),
+        ):
+            with pytest.raises(RuntimeError, match="incomplete"):
+                await manager.run([("1.2.3.4", 6881)])
+
+        from bittorrent.piece_manager import PieceState
+        assert pm.piece_state(0) == PieceState.MISSING
+
+    async def test_partial_peer_then_timeout_then_recovery(self, tmp_path):
+        """Peer A gets piece 0, times out on pieces 1+2; Peer B finishes the rest."""
+        pieces  = make_pieces(3)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        from bittorrent.peer import PeerError
+
+        class PartialTimeoutPeer:
+            host     = "1.2.3.4"
+            port     = 6881
+            bitfield = bytearray(b"\xe0")  # pieces 0,1,2
+
+            async def download_piece(self, idx, size, h):
+                if idx == 0:
+                    return pieces[0]
+                raise PeerError("timeout on piece %d" % idx)
+
+            async def close(self): pass
+
+        good_peer = FakePeer("5.6.7.8", 6882, pieces, bitfield=b"\xe0")
+
+        call_n = 0
+        async def open_side_effect(host, port, *a, **kw):
+            nonlocal call_n
+            call_n += 1
+            return PartialTimeoutPeer() if call_n == 1 else good_peer
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+
+        assert pm.is_complete()
+
+    async def test_disconnected_peer_mid_download(self, tmp_path):
+        """A peer that drops the connection mid-download is replaced cleanly."""
+        pieces  = make_pieces(2)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        from bittorrent.peer import PeerError
+
+        class DisconnectPeer:
+            host     = "1.2.3.4"
+            port     = 6881
+            bitfield = bytearray(b"\xc0")
+
+            async def download_piece(self, idx, size, h):
+                raise PeerError("connection reset by peer")
+
+            async def close(self): pass
+
+        good_peer = FakePeer("5.6.7.8", 6882, pieces, bitfield=b"\xc0")
+
+        call_n = 0
+        async def open_side_effect(host, port, *a, **kw):
+            nonlocal call_n
+            call_n += 1
+            return DisconnectPeer() if call_n == 1 else good_peer
+
+        with patch(
+            "bittorrent.peer_manager.PeerConnection.open",
+            new=AsyncMock(side_effect=open_side_effect),
+        ):
+            await manager.run([("1.2.3.4", 6881), ("5.6.7.8", 6882)])
+
+        assert pm.is_complete()

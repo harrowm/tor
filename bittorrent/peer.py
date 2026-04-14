@@ -39,6 +39,8 @@ from bittorrent.messages import (
 
 log = logging.getLogger(__name__)
 
+BLOCK_TIMEOUT = 30.0  # seconds to wait for a single block response
+
 
 class PeerError(Exception):
     """Raised when a peer behaves unexpectedly or sends bad data."""
@@ -170,13 +172,19 @@ class PeerConnection:
         piece_index: int,
         piece_length: int,
         expected_hash: bytes,
+        *,
+        block_timeout: float = BLOCK_TIMEOUT,
     ) -> bytes:
         """Download one piece from this peer and verify its SHA-1 hash.
 
         Sends INTERESTED, waits for UNCHOKE, pipelines all block REQUESTs,
         collects PIECE messages, assembles and hash-verifies the result.
 
-        Raises PeerError on choke, hash mismatch, or unexpected EOF.
+        Args:
+            block_timeout: Seconds to wait for each individual block response.
+                           Raises PeerError if a peer stalls mid-piece.
+
+        Raises PeerError on choke, hash mismatch, timeout, or unexpected EOF.
         """
         # Tell the peer we're interested
         await self._send_raw(encode_interested())
@@ -194,7 +202,12 @@ class PeerConnection:
         # Collect PIECE responses
         received: dict[int, bytes] = {}   # block_offset -> data
         while len(received) < len(blocks):
-            msg = await self._read_next()
+            try:
+                msg = await asyncio.wait_for(self._read_next(), timeout=block_timeout)
+            except asyncio.TimeoutError:
+                raise PeerError(
+                    f"Timed out waiting for block from piece {piece_index}"
+                )
             if msg.msg_id == MSG_PIECE:
                 idx, block_offset, data = msg.piece_fields()
                 if idx == piece_index:

@@ -389,6 +389,51 @@ class TestDownloadPiece:
         result  = await peer.download_piece(0, BLOCK_SIZE, h)
         assert result == data
 
+    async def test_eof_during_block_receive_raises_peer_error(self):
+        """If the connection closes while waiting for block data, PeerError is raised."""
+        _, h = make_valid_piece(BLOCK_SIZE)
+        unchoke = encode_unchoke()
+        # EOF immediately after unchoke — no block data arrives
+        reader = make_reader(unchoke)
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        with pytest.raises(PeerError):
+            await peer.download_piece(0, BLOCK_SIZE, h)
+
+    async def test_block_timeout_raises_peer_error(self):
+        """A peer that unchokes but then sends no block data raises PeerError."""
+        _, h = make_valid_piece(BLOCK_SIZE)
+        unchoke = encode_unchoke()
+        # Feed unchoke but never feed block data or EOF — simulates a stalled peer
+        reader = asyncio.StreamReader()
+        reader.feed_data(unchoke)
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        with pytest.raises(PeerError, match="[Tt]imed"):
+            await peer.download_piece(0, BLOCK_SIZE, h, block_timeout=0.05)
+
+    async def test_block_timeout_message_includes_piece_index(self):
+        """The PeerError message from a timeout should name the piece index."""
+        _, h = make_valid_piece(BLOCK_SIZE)
+        unchoke = encode_unchoke()
+        reader = asyncio.StreamReader()
+        reader.feed_data(unchoke)
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        with pytest.raises(PeerError, match="piece 7"):
+            await peer.download_piece(7, BLOCK_SIZE, h, block_timeout=0.05)
+
+    async def test_normal_download_unaffected_by_timeout_param(self):
+        """Passing a custom block_timeout doesn't break a normal fast download."""
+        data, h = make_valid_piece(BLOCK_SIZE)
+        responses = encode_piece(0, 0, data)
+        unchoke   = encode_unchoke()
+        reader    = make_reader(unchoke + responses)
+        writer    = MockWriter()
+        peer      = make_peer(reader, writer)
+        result    = await peer.download_piece(0, BLOCK_SIZE, h, block_timeout=5.0)
+        assert result == data
+
 
 # ---------------------------------------------------------------------------
 # close
