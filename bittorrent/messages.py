@@ -16,6 +16,7 @@ block of a piece, which may be smaller).
 from __future__ import annotations
 
 import asyncio
+import socket
 import struct
 from dataclasses import dataclass, field
 
@@ -237,6 +238,40 @@ def encode_cancel(piece_index: int, block_offset: int, block_length: int) -> byt
 # ---------------------------------------------------------------------------
 # Async reader
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# BEP 11 — Peer Exchange (PEX)
+# ---------------------------------------------------------------------------
+
+# Local extension message ID we assign to ut_pex in our extension handshake.
+# When we advertise {"m": {"ut_pex": PEX_LOCAL_ID}}, the remote peer uses this
+# ID to send us PEX messages.
+PEX_LOCAL_ID: int = 1
+
+
+def decode_pex_peers(compact: bytes) -> list[tuple[str, int]]:
+    """Decode a compact IPv4 peer list from a PEX 'added' field.
+
+    Each entry is 6 bytes: 4 bytes big-endian IPv4 + 2 bytes big-endian port.
+    Trailing partial entries are silently ignored.
+    """
+    peers: list[tuple[str, int]] = []
+    for i in range(0, len(compact) - 5, 6):
+        ip = socket.inet_ntoa(compact[i : i + 4])
+        (port,) = struct.unpack("!H", compact[i + 4 : i + 6])
+        if port > 0:
+            peers.append((ip, port))
+    return peers
+
+
+def encode_pex_peers(peers: list[tuple[str, int]]) -> bytes:
+    """Encode a list of (ip, port) peers in compact IPv4 format for PEX."""
+    result = bytearray()
+    for ip, port in peers:
+        result += socket.inet_aton(ip)
+        result += struct.pack("!H", port)
+    return bytes(result)
+
 
 async def read_message(reader: asyncio.StreamReader) -> PeerMessage:
     """Read one message from *reader* and return a PeerMessage.

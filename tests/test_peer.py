@@ -140,7 +140,8 @@ class TestHandshake:
         await peer._handshake(INFO_HASH, PEER_ID)
 
         sent = bytes(writer.buffer)
-        assert len(sent) == 68
+        # After handshake (68 bytes) we immediately send INTERESTED (5 bytes)
+        assert len(sent) == 68 + 5
         assert sent[1:20] == b"BitTorrent protocol"
         assert sent[28:48] == INFO_HASH
         assert sent[48:68] == PEER_ID

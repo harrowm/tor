@@ -141,9 +141,10 @@ class TestRunSuccess:
         args = _parse_args([str(torrent_path), "-o", str(tmp_path)])
 
         response = TrackerResponse(interval=1800, peers=[("1.2.3.4", 6881)])
+        # scan_pieces returns [0] → the only piece is already on disk → pm.is_complete()
         with (
             patch("bittorrent.main.announce", new=AsyncMock(return_value=response)),
-            patch("bittorrent.main.Storage.is_complete", return_value=True),
+            patch("bittorrent.main.Storage.scan_pieces", return_value=[0]),
         ):
             code = await _run(args)
         assert code == 0

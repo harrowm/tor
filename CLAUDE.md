@@ -45,13 +45,15 @@ bittorrent/
 ├── storage.py        # Pre-allocation, random-access writes, hash verify
 ├── messages.py       # Peer wire protocol message encode/decode
 ├── metadata.py       # BEP 9 ut_metadata fetch
-└── magnet.py         # Magnet URI parsing + metadata resolution (BEP 9/10)
+├── magnet.py         # Magnet URI parsing + metadata resolution (BEP 9/10)
+└── dht.py            # BEP 5 DHT peer discovery (Kademlia: bootstrap, get_peers)
 
 tests/
 ├── test_bencode.py
 ├── test_torrent.py
 ├── test_tracker.py
-└── test_peer.py
+├── test_peer.py
+└── test_dht.py
 ```
 
 ## Implementation Phases
@@ -70,7 +72,7 @@ Goal: parse a .torrent, announce to tracker, download one piece from one peer, v
 - [x] `peer_manager.py` — async download orchestration, peer pool, parallel download, end-game (26/26)
 - [x] `main.py` — CLI entry point (14/14)
 
-**482/482 tests passing.**
+**547/547 tests passing.**
 
 ### Phase 0 complete (MVP)
 ### Phase 1 complete (parallel peers, disconnection/timeout handling)
@@ -82,7 +84,7 @@ Goal: parse a .torrent, announce to tracker, download one piece from one peer, v
 
 ### Phase 4 — Stretch goals
 - [x] UDP tracker protocol (BEP 15)
-- DHT (BEP 5)
+- [x] DHT (BEP 5) — bootstrap + iterative get_peers; fallback in magnet + main
 - [x] Magnet links (BEP 9 + BEP 10 extension protocol)
 - Seeding
 

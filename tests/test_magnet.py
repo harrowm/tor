@@ -645,6 +645,7 @@ class TestResolveMagnet:
         from bittorrent.tracker import TrackerResponse
         mock_announce = AsyncMock(return_value=TrackerResponse(interval=1800, peers=[]))
         monkeypatch.setattr("bittorrent.magnet.tracker_announce", mock_announce)
+        monkeypatch.setattr("bittorrent.magnet._dht_get_peers", AsyncMock(return_value=[]))
 
         with pytest.raises(MagnetError, match="No peers"):
             await resolve_magnet(self._make_magnet(), PEER_ID)
@@ -653,6 +654,8 @@ class TestResolveMagnet:
         from bittorrent.tracker import TrackerError
         mock_announce = AsyncMock(side_effect=TrackerError("down"))
         monkeypatch.setattr("bittorrent.magnet.tracker_announce", mock_announce)
+        # Suppress DHT fallback so the test stays deterministic
+        monkeypatch.setattr("bittorrent.magnet._dht_get_peers", AsyncMock(return_value=[]))
 
         with pytest.raises(MagnetError, match="No peers"):
             await resolve_magnet(self._make_magnet(), PEER_ID)

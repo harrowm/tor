@@ -100,6 +100,36 @@ class Storage:
                 return False
         return True
 
+    def scan_pieces(
+        self,
+        progress_cb: "Callable[[int, int], None] | None" = None,
+    ) -> list[int]:
+        """Read and hash-verify every piece on disk; return indices of good ones.
+
+        Used at startup to resume a partial download: any piece whose SHA-1
+        matches is marked complete so it won't be re-downloaded.
+
+        Args:
+            progress_cb: Optional callable(done, total) called after each piece,
+                         useful for showing a progress indicator to the user.
+
+        Returns:
+            Sorted list of piece indices that are already complete on disk.
+        """
+        from typing import Callable  # local to avoid circular imports at module level
+        good: list[int] = []
+        total = self._torrent.num_pieces
+        for i in range(total):
+            if progress_cb:
+                progress_cb(i, total)
+            try:
+                data = self.read_piece(i)
+            except (OSError, StorageError):
+                continue
+            if self.verify_piece(i, data):
+                good.append(i)
+        return good
+
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------

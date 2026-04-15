@@ -31,6 +31,7 @@ from rich.progress import (
 from rich.table import Column
 from rich.text import Text
 
+from bittorrent.dht import DHTClient
 from bittorrent.magnet import MagnetError, parse_magnet, resolve_magnet
 from bittorrent.peer_manager import PeerManager
 from bittorrent.piece_manager import PieceManager
@@ -40,6 +41,16 @@ from bittorrent.tracker import TrackerError, announce, generate_peer_id
 
 # Characters used to render the piece map (low → high completion)
 _MAP_CHARS = " ░▒▓█"
+
+
+def _torrent_paths(torrent: "Torrent", output_dir: Path) -> list[Path]:
+    """Return the on-disk paths for all files in *torrent*."""
+    if torrent.is_multi_file:
+        return [
+            output_dir / torrent.name / Path(*f.path)
+            for f in torrent.files
+        ]
+    return [output_dir / torrent.name]
 
 
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -132,6 +143,31 @@ async def _announce_all(
     return all_peers
 
 
+async def _dht_peers(
+    info_hash: bytes,
+    console: Console,
+    *,
+    timeout: float = 60.0,
+) -> list[tuple[str, int]]:
+    """Bootstrap DHT and run get_peers for *info_hash* concurrently.
+
+    Returns a (possibly empty) list of (ip, port) peers.  Never raises.
+    """
+    try:
+        async with DHTClient() as dht:
+            # Allow up to 20 s for bootstrap; give the bulk of the budget
+            # to the iterative get_peers lookup where the real work happens.
+            bootstrap_timeout = min(20.0, timeout * 0.3)
+            n = await asyncio.wait_for(dht.bootstrap(), timeout=bootstrap_timeout)
+            console.print(f"DHT bootstrapped: [bold]{n}[/bold] nodes")
+            peers = await dht.get_peers(info_hash, timeout=timeout - bootstrap_timeout)
+            console.print(f"DHT peers: [bold]{len(peers)}[/bold]")
+            return peers
+    except Exception as exc:
+        console.print(f"[dim]DHT: {exc}[/dim]")
+        return []
+
+
 async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
     """Main async body. Returns exit code."""
     log = logging.getLogger(__name__)
@@ -179,10 +215,22 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         console.print(f"[bold]Trackers:[/bold]  {all_trackers}")
         peers = []  # populated below
 
-    # --- Announce to all trackers (BEP 12) ---
-    extra_peers = await _announce_all(torrent, peer_id, args.port, console)
-    peers = list({*map(tuple, peers), *map(tuple, extra_peers)})  # deduplicate
-    peers = [tuple(p) for p in peers]  # ensure list[tuple[str,int]]
+    # --- Announce to all trackers (BEP 12) concurrently with DHT lookup ---
+    tracker_task = asyncio.create_task(
+        _announce_all(torrent, peer_id, args.port, console)
+    )
+    dht_task = asyncio.create_task(
+        _dht_peers(torrent.info_hash, console)
+    )
+    extra_peers, dht_peers = await asyncio.gather(tracker_task, dht_task)
+    all_found = list(peers) + list(extra_peers) + list(dht_peers)
+    seen: set[tuple] = set()
+    peers = []
+    for p in all_found:
+        pt = tuple(p)
+        if pt not in seen:
+            seen.add(pt)
+            peers.append(pt)
 
     if not peers:
         console.print("[red]No peers — cannot download.[/red]")
@@ -197,10 +245,27 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         torrent.total_length,
     )
 
-    # --- Check if already complete ---
-    if storage.is_complete():
-        console.print("[green]Already downloaded — nothing to do.[/green]")
-        return 0
+    # --- Resume: scan existing pieces ---
+    storage.allocate()   # ensure files exist before scanning
+    if any(p.exists() for p in _torrent_paths(torrent, output_dir)):
+        console.print("Scanning existing files for resume…")
+        done_count = [0]
+        def _scan_cb(i: int, total: int) -> None:
+            done_count[0] = i + 1
+        good_pieces = storage.scan_pieces(progress_cb=_scan_cb)
+        if good_pieces:
+            for idx in good_pieces:
+                pm.mark_complete(idx)
+            console.print(
+                f"Resuming: [bold]{len(good_pieces)}[/bold]/{torrent.num_pieces} "
+                f"pieces already on disk."
+            )
+        if pm.is_complete():
+            console.print("[green]Already downloaded — nothing to do.[/green]")
+            return 0
+    else:
+        # Fresh download — allocate was already called above.
+        pass
 
     # --- Build Rich progress display ---
     progress = Progress(
@@ -213,10 +278,12 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         console=console,
         expand=True,
     )
+    # Seed the progress bar from pieces already complete (resume case).
+    _resume_bytes = min(pm.progress()[0] * torrent.piece_length, torrent.total_length)
     task_id: TaskID = progress.add_task(
         "Downloading",
         total=torrent.total_length,
-        completed=0,
+        completed=_resume_bytes,
     )
 
     # Mutable state updated by on_progress
@@ -256,6 +323,7 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         torrent, pm, storage,
         info_hash=torrent.info_hash,
         peer_id=peer_id,
+        use_utp=True,   # BEP 29: fall back to uTP when TCP is blocked
     )
 
     console.print()
@@ -269,7 +337,7 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
 
             tick_task = asyncio.create_task(_tick())
             try:
-                await manager.run(peers, on_progress=on_progress)
+                await manager.run(peers, on_progress=on_progress, allocate=False)
             finally:
                 tick_task.cancel()
                 try:

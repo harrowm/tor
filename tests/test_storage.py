@@ -347,3 +347,86 @@ class TestIsComplete:
         s = Storage(t, tmp_path)
         # Don't call allocate — file doesn't exist
         assert s.is_complete() is False
+
+
+# ---------------------------------------------------------------------------
+# scan_pieces (resume)
+# ---------------------------------------------------------------------------
+
+class TestScanPieces:
+    def test_all_pieces_correct(self, tmp_path):
+        p0 = b"\xaa" * 512
+        p1 = b"\xbb" * 512
+        t  = single_file_torrent(pieces_data=[p0, p1])
+        s  = Storage(t, tmp_path)
+        s.allocate()
+        s.write_piece(0, p0)
+        s.write_piece(1, p1)
+        assert s.scan_pieces() == [0, 1]
+
+    def test_partial_pieces_correct(self, tmp_path):
+        p0 = b"\xaa" * 512
+        p1 = b"\xbb" * 512
+        t  = single_file_torrent(pieces_data=[p0, p1])
+        s  = Storage(t, tmp_path)
+        s.allocate()
+        s.write_piece(0, p0)
+        # p1 not written — zeros won't hash-match
+        result = s.scan_pieces()
+        assert result == [0]
+
+    def test_no_pieces_correct(self, tmp_path):
+        p0 = b"\xaa" * 512
+        t  = single_file_torrent(pieces_data=[p0])
+        s  = Storage(t, tmp_path)
+        s.allocate()
+        # File exists but contains zeros — wrong hash
+        assert s.scan_pieces() == []
+
+    def test_file_missing_returns_empty(self, tmp_path):
+        p0 = b"\xaa" * 512
+        t  = single_file_torrent(pieces_data=[p0])
+        s  = Storage(t, tmp_path)
+        # No allocate, file doesn't exist
+        assert s.scan_pieces() == []
+
+    def test_progress_callback_called(self, tmp_path):
+        p0 = b"\xaa" * 512
+        p1 = b"\xbb" * 512
+        t  = single_file_torrent(pieces_data=[p0, p1])
+        s  = Storage(t, tmp_path)
+        s.allocate()
+        s.write_piece(0, p0)
+        s.write_piece(1, p1)
+
+        calls: list[tuple[int, int]] = []
+        s.scan_pieces(progress_cb=lambda i, total: calls.append((i, total)))
+        assert len(calls) == 2
+        assert calls[0] == (0, 2)
+        assert calls[1] == (1, 2)
+
+    def test_multifile_partial(self, tmp_path):
+        p0 = b"\xaa" * 512
+        p1 = b"\xbb" * 100 + b"\xcc" * 412   # spans file boundary
+        t  = multi_file_torrent(
+            piece_length=512,
+            files=[(["a.bin"], p0 + p1[:100]), (["b.bin"], p1[100:])],
+        )
+        s = Storage(t, tmp_path)
+        s.allocate()
+        s.write_piece(0, p0)
+        # p1 not written
+        assert s.scan_pieces() == [0]
+
+    def test_scan_pieces_returns_sorted_indices(self, tmp_path):
+        # Use i+1 so no piece is all-zeros (which would match the pre-allocated file)
+        pieces = [bytes([i + 1]) * 512 for i in range(4)]
+        t = single_file_torrent(pieces_data=pieces)
+        s = Storage(t, tmp_path)
+        s.allocate()
+        # Write pieces out of order
+        s.write_piece(3, pieces[3])
+        s.write_piece(1, pieces[1])
+        result = s.scan_pieces()
+        assert result == sorted(result)
+        assert set(result) == {1, 3}

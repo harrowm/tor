@@ -48,6 +48,9 @@ class Torrent:
     # Multi-file torrents (empty for single-file)
     files: list[FileInfo] = field(default_factory=list)
 
+    # BEP 19: web seed URLs (empty if none)
+    url_list: list[str] = field(default_factory=list)
+
     # --- derived ---
     @property
     def total_length(self) -> int:
@@ -174,6 +177,23 @@ def parse(data: bytes) -> Torrent:
         # Single-file mode
         length = _require(info, b"length", int, "info.length")
 
+    # --- url-list (BEP 19 web seeds, optional) ---
+    url_list: list[str] = []
+    if b"url-list" in meta:
+        raw_urls = meta[b"url-list"]
+        if isinstance(raw_urls, bytes):
+            try:
+                url_list = [raw_urls.decode("utf-8")]
+            except UnicodeDecodeError:
+                pass
+        elif isinstance(raw_urls, list):
+            for u in raw_urls:
+                if isinstance(u, bytes):
+                    try:
+                        url_list.append(u.decode("utf-8"))
+                    except UnicodeDecodeError:
+                        pass
+
     return Torrent(
         announce=announce,
         announce_list=announce_list,
@@ -184,6 +204,7 @@ def parse(data: bytes) -> Torrent:
         piece_hashes=piece_hashes,
         length=length,
         files=files,
+        url_list=url_list,
     )
 
 

@@ -70,9 +70,18 @@ class FakePeer:
         self.port    = port
         self.bitfield = bytearray(bitfield)
         self._pieces  = pieces
+        # BEP 10 extension protocol attributes (default: no extension support)
+        self.remote_supports_extensions = False
+        self._pending: list = []
 
     async def download_piece(self, piece_index, piece_size, expected_hash):
         return self._pieces[piece_index]
+
+    async def do_extension_handshake(self, extensions, *, timeout=15.0):
+        pass
+
+    def peer_ext_id(self, name):
+        return None
 
     async def close(self):
         pass
@@ -750,3 +759,300 @@ class TestNoBitfield:
             await manager.run([("1.2.3.4", 6881)])
 
         assert pm.num_complete == 2
+
+
+# ---------------------------------------------------------------------------
+# BEP 11 — Peer Exchange (PEX)
+# ---------------------------------------------------------------------------
+
+class TestPEX:
+    """Tests for BEP 11 PEX peer exchange support."""
+
+    # --- Unit tests for decode_pex_peers / encode_pex_peers ---
+
+    def test_decode_pex_peers_basic(self):
+        from bittorrent.messages import decode_pex_peers
+        import socket, struct
+        raw = socket.inet_aton("1.2.3.4") + struct.pack("!H", 6881)
+        assert decode_pex_peers(raw) == [("1.2.3.4", 6881)]
+
+    def test_decode_pex_peers_multiple(self):
+        from bittorrent.messages import decode_pex_peers
+        import socket, struct
+        raw = (
+            socket.inet_aton("1.1.1.1") + struct.pack("!H", 1111) +
+            socket.inet_aton("2.2.2.2") + struct.pack("!H", 2222)
+        )
+        peers = decode_pex_peers(raw)
+        assert peers == [("1.1.1.1", 1111), ("2.2.2.2", 2222)]
+
+    def test_decode_pex_peers_empty(self):
+        from bittorrent.messages import decode_pex_peers
+        assert decode_pex_peers(b"") == []
+
+    def test_decode_pex_peers_skips_port_zero(self):
+        from bittorrent.messages import decode_pex_peers
+        import socket, struct
+        raw = socket.inet_aton("1.2.3.4") + struct.pack("!H", 0)
+        assert decode_pex_peers(raw) == []
+
+    def test_decode_pex_peers_partial_entry_ignored(self):
+        """Trailing bytes that don't form a complete 6-byte entry are ignored."""
+        from bittorrent.messages import decode_pex_peers
+        import socket, struct
+        raw = socket.inet_aton("1.2.3.4") + struct.pack("!H", 6881) + b"\x01\x02"
+        assert decode_pex_peers(raw) == [("1.2.3.4", 6881)]
+
+    def test_encode_pex_peers_basic(self):
+        from bittorrent.messages import encode_pex_peers
+        import socket, struct
+        result = encode_pex_peers([("1.2.3.4", 6881)])
+        assert result == socket.inet_aton("1.2.3.4") + struct.pack("!H", 6881)
+
+    def test_encode_pex_peers_empty(self):
+        from bittorrent.messages import encode_pex_peers
+        assert encode_pex_peers([]) == b""
+
+    def test_encode_decode_roundtrip(self):
+        from bittorrent.messages import decode_pex_peers, encode_pex_peers
+        peers = [("10.0.0.1", 6881), ("192.168.1.1", 6882)]
+        assert decode_pex_peers(encode_pex_peers(peers)) == peers
+
+    # --- Integration: PEX peers are added to queue during download ---
+
+    async def test_pex_peers_added_to_queue(self, tmp_path):
+        """PEX message received during download adds new peers to the queue."""
+        import socket, struct
+        from bittorrent.bencode import encode as bencode
+        from bittorrent.messages import MSG_EXTENDED, PEX_LOCAL_ID, PeerMessage
+
+        pieces = make_pieces(2)
+        torrent = make_torrent(pieces)
+        pm = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        # Encode a PEX message with one peer
+        pex_peer_compact = socket.inet_aton("9.8.7.6") + struct.pack("!H", 9999)
+        pex_payload = bencode({b"added": pex_peer_compact})
+        pex_msg = PeerMessage(MSG_EXTENDED, bytes([PEX_LOCAL_ID]) + pex_payload)
+
+        class PEXPeer(FakePeer):
+            """After piece 0, injects a PEX message into _pending."""
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.remote_supports_extensions = False
+                self._pending = []
+                self._pex_injected = False
+
+            async def download_piece(self, idx, size, h):
+                data = await super().download_piece(idx, size, h)
+                if not self._pex_injected:
+                    self._pending.append(pex_msg)
+                    self._pex_injected = True
+                return data
+
+            async def do_extension_handshake(self, *a, **kw):
+                pass
+
+            def peer_ext_id(self, name):
+                return None
+
+        pex_peer = PEXPeer("1.2.3.4", 6881, pieces, bitfield=b"\xc0")
+
+        with patch_open(pex_peer):
+            await manager.run([("1.2.3.4", 6881)])
+
+        # Download completes with 2 pieces
+        assert pm.num_complete == 2
+
+    async def test_extension_handshake_attempted_when_supported(self, tmp_path):
+        """Extension handshake is called when peer supports extensions."""
+        pieces = make_pieces(1)
+        torrent = make_torrent(pieces)
+        pm = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        hs_calls = []
+
+        class ExtPeer(FakePeer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.remote_supports_extensions = True
+                self._pending = []
+                self._peer_ext_ids = {}
+
+            async def do_extension_handshake(self, extensions, *, timeout=15.0):
+                hs_calls.append(extensions)
+
+            def peer_ext_id(self, name):
+                return None
+
+        ext_peer = ExtPeer("1.2.3.4", 6881, pieces, bitfield=b"\x80")
+
+        with patch_open(ext_peer):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert len(hs_calls) == 1
+        assert b"ut_pex" in hs_calls[0]
+
+    async def test_extension_handshake_skipped_when_not_supported(self, tmp_path):
+        """Extension handshake is NOT called when peer doesn't support extensions."""
+        pieces = make_pieces(1)
+        torrent = make_torrent(pieces)
+        pm = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        hs_calls = []
+
+        class NoExtPeer(FakePeer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.remote_supports_extensions = False
+                self._pending = []
+
+            async def do_extension_handshake(self, extensions, *, timeout=15.0):
+                hs_calls.append(extensions)
+
+            def peer_ext_id(self, name):
+                return None
+
+        peer = NoExtPeer("1.2.3.4", 6881, pieces, bitfield=b"\x80")
+
+        with patch_open(peer):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert len(hs_calls) == 0
+
+    async def test_pex_failure_does_not_abort_download(self, tmp_path):
+        """If extension handshake raises PeerError, download continues."""
+        from bittorrent.peer import PeerError
+
+        pieces = make_pieces(1)
+        torrent = make_torrent(pieces)
+        pm = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        class FailExtPeer(FakePeer):
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self.remote_supports_extensions = True
+                self._pending = []
+                self._peer_ext_ids = {}
+
+            async def do_extension_handshake(self, extensions, *, timeout=15.0):
+                raise PeerError("extension handshake failed")
+
+            def peer_ext_id(self, name):
+                return None
+
+        peer = FailExtPeer("1.2.3.4", 6881, pieces, bitfield=b"\x80")
+
+        with patch_open(peer):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert pm.is_complete()
+
+
+# ---------------------------------------------------------------------------
+# BEP 29 — uTP fallback
+# ---------------------------------------------------------------------------
+
+class TestUTPFallback:
+    """Tests for uTP (BEP 29) as a TCP fallback."""
+
+    async def test_utp_fallback_used_when_tcp_fails(self, tmp_path):
+        """When TCP fails and use_utp=True, uTP connection is attempted."""
+        from bittorrent.peer import PeerError
+
+        pieces  = make_pieces(1)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = PeerManager(torrent, pm, storage, INFO_HASH, PEER_ID, use_utp=True)
+
+        fake = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\x80")
+
+        with (
+            patch("bittorrent.peer_manager.PeerConnection.open",
+                  new=AsyncMock(side_effect=PeerError("TCP refused"))),
+            patch("bittorrent.peer_manager.PeerConnection.open_utp",
+                  new=AsyncMock(return_value=fake)),
+        ):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert pm.is_complete()
+
+    async def test_utp_not_attempted_when_disabled(self, tmp_path):
+        """With use_utp=False (default), uTP is never tried when TCP fails."""
+        from bittorrent.peer import PeerError
+
+        pieces  = make_pieces(1)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)  # use_utp defaults to False
+
+        utp_calls = []
+
+        async def fake_open_utp(*args, **kwargs):
+            utp_calls.append(True)
+            return FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\x80")
+
+        with (
+            patch("bittorrent.peer_manager.PeerConnection.open",
+                  new=AsyncMock(side_effect=PeerError("TCP refused"))),
+            patch("bittorrent.peer_manager.PeerConnection.open_utp",
+                  new=AsyncMock(side_effect=fake_open_utp)),
+        ):
+            with pytest.raises(RuntimeError, match="incomplete"):
+                await manager.run([("1.2.3.4", 6881)])
+
+        assert utp_calls == []  # uTP was never tried
+
+    async def test_raises_when_both_tcp_and_utp_fail(self, tmp_path):
+        """When both TCP and uTP fail, the download raises RuntimeError."""
+        from bittorrent.peer import PeerError
+        from bittorrent.utp import UTPError
+
+        pieces  = make_pieces(1)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = PeerManager(torrent, pm, storage, INFO_HASH, PEER_ID, use_utp=True)
+
+        with (
+            patch("bittorrent.peer_manager.PeerConnection.open",
+                  new=AsyncMock(side_effect=PeerError("TCP refused"))),
+            patch("bittorrent.peer_manager.PeerConnection.open_utp",
+                  new=AsyncMock(side_effect=UTPError("uTP timeout"))),
+        ):
+            with pytest.raises(RuntimeError, match="incomplete"):
+                await manager.run([("1.2.3.4", 6881)])
+
+    async def test_utp_download_completes_correctly(self, tmp_path):
+        """A download via uTP produces the same result as via TCP."""
+        pieces  = make_pieces(3)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = PeerManager(torrent, pm, storage, INFO_HASH, PEER_ID, use_utp=True)
+
+        from bittorrent.peer import PeerError
+
+        utp_peer = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\xe0")
+
+        with (
+            patch("bittorrent.peer_manager.PeerConnection.open",
+                  new=AsyncMock(side_effect=PeerError("TCP refused"))),
+            patch("bittorrent.peer_manager.PeerConnection.open_utp",
+                  new=AsyncMock(return_value=utp_peer)),
+        ):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert pm.is_complete()
+        for i, expected in enumerate(pieces):
+            assert storage.read_piece(i) == expected

@@ -22,6 +22,7 @@ import logging
 import urllib.parse
 from dataclasses import dataclass, field
 
+from bittorrent.dht import DHTClient
 from bittorrent.metadata import fetch_metadata
 from bittorrent.peer import PeerConnection, PeerError
 from bittorrent.torrent import Torrent, parse as parse_torrent
@@ -115,21 +116,25 @@ async def resolve_magnet(
     *,
     max_peers: int = 10,
     peer_timeout: float = 30.0,
+    dht_timeout: float = 30.0,
 ) -> Torrent:
     """Fetch torrent metadata from peers and return a Torrent.
 
-    Announces to all trackers in the magnet link to gather peers, then
-    tries peers in order until the metadata is fetched and SHA-1 verified.
+    Announces to all trackers in the magnet link to gather peers.  If no
+    tracker peers are found (or there are no trackers), falls back to a DHT
+    get_peers lookup (BEP 5).  Then tries peers in order until the metadata
+    is fetched and SHA-1 verified.
 
     Args:
         magnet:       Parsed magnet link.
         peer_id:      20-byte peer identity.
         port:         Port to advertise to trackers.
-        max_peers:    Maximum number of peers to try.
+        max_peers:    Maximum number of peers to try for metadata.
         peer_timeout: Seconds allowed per peer for the full metadata fetch.
+        dht_timeout:  Seconds allowed for DHT bootstrap + get_peers lookup.
 
     Raises:
-        MagnetError: No trackers return peers, or no peer delivers valid metadata.
+        MagnetError: No peers found at all, or no peer delivers valid metadata.
     """
     peers: list[tuple[str, int]] = []
 
@@ -144,8 +149,15 @@ async def resolve_magnet(
         except TrackerError as exc:
             log.warning("Tracker %s failed: %s", tracker_url, exc)
 
+    # Fall back to DHT when trackers yield no peers (or there are no trackers)
     if not peers:
-        raise MagnetError("No peers found from any tracker in the magnet link")
+        log.info("No tracker peers — trying DHT lookup")
+        dht_peers = await _dht_get_peers(magnet.info_hash, timeout=dht_timeout)
+        peers.extend(dht_peers)
+        log.info("DHT returned %d peers", len(dht_peers))
+
+    if not peers:
+        raise MagnetError("No peers found from trackers or DHT")
 
     last_exc: Exception = MagnetError("No peers tried")
     for host, peer_port in peers[:max_peers]:
@@ -168,6 +180,25 @@ async def resolve_magnet(
         f"Could not fetch metadata from any of "
         f"{min(len(peers), max_peers)} peers: {last_exc}"
     )
+
+
+async def _dht_get_peers(
+    info_hash: bytes,
+    *,
+    timeout: float = 30.0,
+) -> list[tuple[str, int]]:
+    """Bootstrap DHT and perform a get_peers lookup for *info_hash*.
+
+    Returns a list of (ip, port) tuples.  Never raises; returns [] on failure.
+    """
+    try:
+        async with DHTClient() as dht:
+            await asyncio.wait_for(dht.bootstrap(), timeout=timeout / 2)
+            remaining = timeout / 2
+            return await dht.get_peers(info_hash, timeout=remaining)
+    except Exception as exc:
+        log.warning("DHT lookup failed: %s", exc)
+        return []
 
 
 async def _metadata_from_peer(
