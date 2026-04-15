@@ -40,61 +40,87 @@ bittorrent/
 ├── torrent.py        # .torrent file parser + info_hash computation
 ├── tracker.py        # HTTP + UDP tracker announce
 ├── peer.py           # Single peer connection (asyncio streams, BEP 10 extensions)
-├── peer_manager.py   # Connection pool and peer selection
+├── peer_manager.py   # Connection pool, peer selection, PEX, web seed workers
 ├── piece_manager.py  # Piece/block state machine, rarest-first selection
-├── storage.py        # Pre-allocation, random-access writes, hash verify
-├── messages.py       # Peer wire protocol message encode/decode
+├── storage.py        # Pre-allocation, random-access writes, hash verify, resume scan
+├── messages.py       # Peer wire protocol encode/decode + PEX helpers
 ├── metadata.py       # BEP 9 ut_metadata fetch
 ├── magnet.py         # Magnet URI parsing + metadata resolution (BEP 9/10)
-└── dht.py            # BEP 5 DHT peer discovery (Kademlia: bootstrap, get_peers)
+├── dht.py            # BEP 5 DHT peer discovery (Kademlia: bootstrap, get_peers)
+├── utp.py            # BEP 29 uTP transport over UDP
+└── webseed.py        # BEP 19 HTTP web seed fetching
 
 tests/
 ├── test_bencode.py
 ├── test_torrent.py
 ├── test_tracker.py
 ├── test_peer.py
-└── test_dht.py
+├── test_peer_manager.py
+├── test_piece_manager.py
+├── test_storage.py
+├── test_main.py
+├── test_magnet.py
+├── test_dht.py
+├── test_utp.py
+└── test_webseed.py
 ```
 
 ## Implementation Phases
 
-### Phase 0 — MVP (current)
-Goal: parse a .torrent, announce to tracker, download one piece from one peer, verify SHA-1, write to disk.
-
+### Phase 0 — MVP ✓
 - [x] Project skeleton + uv setup
-- [x] `bencode.py` — decoder and encoder, fully tested (76/76)
-- [x] `torrent.py` — parse .torrent file, compute info_hash correctly (29/29)
-- [x] `tracker.py` — HTTP + UDP (BEP 15) announce, parse compact peer list (84/84)
-- [x] `messages.py` — peer wire protocol encode/decode (64/64)
-- [x] `peer.py` — handshake, bitfield, piece download with block pipelining (35/35)
-- [x] `storage.py` — pre-alloc, random-access writes, multi-file spanning (23/23)
-- [x] `piece_manager.py` — state machine, sequential + rarest-first + end-game selection (60/60)
-- [x] `peer_manager.py` — async download orchestration, peer pool, parallel download, end-game (26/26)
-- [x] `main.py` — CLI entry point (14/14)
+- [x] `bencode.py` — decoder and encoder
+- [x] `torrent.py` — parse .torrent file, compute info_hash correctly
+- [x] `tracker.py` — HTTP + UDP (BEP 15) announce, parse compact peer list
+- [x] `messages.py` — peer wire protocol encode/decode
+- [x] `peer.py` — handshake, bitfield, piece download with block pipelining
+- [x] `storage.py` — pre-alloc, random-access writes, multi-file spanning
+- [x] `piece_manager.py` — state machine, sequential + rarest-first + end-game selection
+- [x] `peer_manager.py` — async download orchestration, peer pool, parallel download, end-game
+- [x] `main.py` — CLI entry point with Rich progress display
 
-**547/547 tests passing.**
+### Phase 1 — Parallel peers + robustness ✓
+- [x] Multiple concurrent peer connections (up to 30)
+- [x] Disconnection/timeout handling — failed pieces returned to MISSING
+- [x] Stall-wait logic — workers wait when all pieces are in-flight
+- [x] Re-announce to tracker during long downloads
 
-### Phase 0 complete (MVP)
-### Phase 1 complete (parallel peers, disconnection/timeout handling)
-### Phase 2 end-game complete; multi-file/pre-alloc done in Phase 0
+### Phase 2 — End-game + multi-file ✓
+- [x] End-game mode — last few pieces requested from multiple peers simultaneously
+- [x] Multi-file torrent support with cross-file piece spanning
+- [x] Pre-allocation of all files before download
 
 ### Phase 3 — Choking + performance
-- Tit-for-tat choke/unchoke
-- Upload slots
+- [ ] Tit-for-tat choke/unchoke (BEP 3)
+- [ ] Upload slots
+- [ ] Keep-alive messages (currently peers may time out on long stalls)
 
 ### Phase 4 — Stretch goals
 - [x] UDP tracker protocol (BEP 15)
-- [x] DHT (BEP 5) — bootstrap + iterative get_peers; fallback in magnet + main
+- [x] DHT peer discovery (BEP 5) — Kademlia bootstrap + iterative get_peers
 - [x] Magnet links (BEP 9 + BEP 10 extension protocol)
-- Seeding
+- [x] Resume/partial download — SHA-1 scan of existing pieces on startup
+- [x] Peer Exchange / PEX (BEP 11) — peers share peer lists via ut_pex extension
+- [x] uTP transport (BEP 29) — reliable delivery over UDP, TCP fallback
+- [x] Web seeds (BEP 19) — HTTP Range fetching from url-list servers
+- [ ] Seeding / uploading to peers
+- [ ] IPv6 peer support
+- [ ] HTTPS tracker support
+
+**640/640 tests passing.**
 
 ## Key BEP References
 
 - **BEP 3** — Core protocol (peer wire, piece hashing)
+- **BEP 5** — DHT (Kademlia peer discovery)
+- **BEP 9** — Metadata exchange (magnet links)
+- **BEP 10** — Extension protocol
+- **BEP 11** — Peer Exchange (PEX)
+- **BEP 12** — Multitracker (announce-list)
+- **BEP 15** — UDP tracker protocol
+- **BEP 19** — Web seeds (HTTP seeding)
 - **BEP 23** — Compact tracker response format
-- **BEP 10** — Extension protocol (needed for magnet metadata)
-- **BEP 9** — Metadata exchange
-- **BEP 5** — DHT
+- **BEP 29** — uTP (Micro Transport Protocol)
 
 ## Critical Technical Notes
 
