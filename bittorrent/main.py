@@ -31,6 +31,7 @@ from rich.progress import (
 from rich.table import Column
 from rich.text import Text
 
+from bittorrent.magnet import MagnetError, parse_magnet, resolve_magnet
 from bittorrent.peer_manager import PeerManager
 from bittorrent.piece_manager import PieceManager
 from bittorrent.storage import Storage
@@ -46,7 +47,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         prog="bittorrent",
         description="Minimal BitTorrent client",
     )
-    parser.add_argument("torrent_file", help=".torrent file to download")
+    parser.add_argument("source", help=".torrent file or magnet URI to download")
     parser.add_argument(
         "--output-dir", "-o",
         default=".",
@@ -88,45 +89,71 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
     if console is None:
         console = Console(stderr=True)
 
-    # --- Parse torrent file ---
-    try:
-        torrent = load(args.torrent_file)
-    except (ParseError, OSError) as exc:
-        print(f"Error reading torrent file: {exc}", file=sys.stderr)
-        return 1
-    console.print(f"[bold]Name:[/bold]      {torrent.name}")
-    console.print(f"[bold]Size:[/bold]      {torrent.total_length:,} bytes")
-    console.print(f"[bold]Pieces:[/bold]    {torrent.num_pieces} × {torrent.piece_length:,} bytes")
-    console.print(f"[bold]Info hash:[/bold] {torrent.info_hash_hex}")
-    console.print(f"[bold]Tracker:[/bold]   {torrent.announce}")
-
-    # --- Generate peer identity ---
+    # --- Generate peer identity (needed for both .torrent and magnet flows) ---
     peer_id = generate_peer_id()
     log.debug("peer_id: %s", peer_id.hex())
 
-    # --- Announce to tracker ---
-    console.print("\nAnnouncing to tracker…")
-    try:
-        response = await announce(
-            torrent.announce,
-            torrent.info_hash,
-            peer_id,
-            args.port,
-            left=torrent.total_length,
-            event="started",
-        )
-    except TrackerError as exc:
-        console.print(f"[red]Tracker error:[/red] {exc}")
-        return 1
+    source = args.source
 
-    peers = response.peers
-    console.print(
-        f"Got [bold]{len(peers)}[/bold] peers "
-        f"(seeders={response.complete}, leechers={response.incomplete})"
-    )
+    # --- Parse torrent or resolve magnet ---
+    if source.lower().startswith("magnet:"):
+        try:
+            magnet = parse_magnet(source)
+        except MagnetError as exc:
+            print(f"Invalid magnet URI: {exc}", file=sys.stderr)
+            return 1
+        console.print(f"[bold]Magnet:[/bold]    {magnet.name or '(unknown name)'}")
+        console.print(f"[bold]Info hash:[/bold] {magnet.info_hash_hex}")
+        console.print(f"[bold]Trackers:[/bold]  {len(magnet.trackers)}")
+        console.print("\nFetching metadata from peers…")
+        try:
+            torrent = await resolve_magnet(magnet, peer_id, args.port)
+        except MagnetError as exc:
+            console.print(f"[red]Magnet error:[/red] {exc}")
+            return 1
+        console.print(f"[bold]Name:[/bold]      {torrent.name}")
+        console.print(f"[bold]Size:[/bold]      {torrent.total_length:,} bytes")
+        console.print(f"[bold]Pieces:[/bold]    {torrent.num_pieces} × {torrent.piece_length:,} bytes")
+        peers: list[tuple[str, int]] = []   # will re-announce below
+    else:
+        try:
+            torrent = load(source)
+        except (ParseError, OSError) as exc:
+            print(f"Error reading torrent file: {exc}", file=sys.stderr)
+            return 1
+        console.print(f"[bold]Name:[/bold]      {torrent.name}")
+        console.print(f"[bold]Size:[/bold]      {torrent.total_length:,} bytes")
+        console.print(f"[bold]Pieces:[/bold]    {torrent.num_pieces} × {torrent.piece_length:,} bytes")
+        console.print(f"[bold]Info hash:[/bold] {torrent.info_hash_hex}")
+        console.print(f"[bold]Tracker:[/bold]   {torrent.announce}")
+        peers = []  # populated below
+
+    # --- Announce to tracker ---
+    if torrent.announce:
+        console.print("\nAnnouncing to tracker…")
+        try:
+            response = await announce(
+                torrent.announce,
+                torrent.info_hash,
+                peer_id,
+                args.port,
+                left=torrent.total_length,
+                event="started",
+            )
+        except TrackerError as exc:
+            console.print(f"[red]Tracker error:[/red] {exc}")
+            if not peers:
+                return 1
+            # For magnet flows we may already have peers; tracker failure is non-fatal
+        else:
+            peers = response.peers
+            console.print(
+                f"Got [bold]{len(peers)}[/bold] peers "
+                f"(seeders={response.complete}, leechers={response.incomplete})"
+            )
 
     if not peers:
-        console.print("[red]No peers returned by tracker — cannot download.[/red]")
+        console.print("[red]No peers — cannot download.[/red]")
         return 1
 
     # --- Set up storage and piece tracking ---

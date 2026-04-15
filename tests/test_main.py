@@ -24,9 +24,9 @@ from bittorrent.tracker import TrackerResponse
 # ---------------------------------------------------------------------------
 
 class TestParseArgs:
-    def test_positional_torrent_file(self):
+    def test_positional_source(self):
         args = _parse_args(["foo.torrent"])
-        assert args.torrent_file == "foo.torrent"
+        assert args.source == "foo.torrent"
 
     def test_default_output_dir(self):
         args = _parse_args(["foo.torrent"])

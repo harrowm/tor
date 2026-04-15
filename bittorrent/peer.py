@@ -23,18 +23,22 @@ from typing import TYPE_CHECKING
 
 from bittorrent.messages import (
     BLOCK_SIZE,
+    EXT_PROTOCOL_RESERVED,
     HANDSHAKE_LEN,
     MSG_BITFIELD,
     MSG_CHOKE,
+    MSG_EXTENDED,
     MSG_HAVE,
     MSG_PIECE,
     MSG_UNCHOKE,
     PeerMessage,
-    decode_handshake,
+    decode_handshake_full,
+    encode_extended,
     encode_handshake,
     encode_interested,
     encode_request,
     read_message,
+    supports_extension_protocol,
 )
 
 log = logging.getLogger(__name__)
@@ -61,6 +65,11 @@ class PeerConnection:
         self.bitfield: bytearray = bytearray()   # one bit per piece
         self._pending: list[PeerMessage] = []    # messages read ahead, not yet consumed
 
+        # BEP 10 extension protocol state (populated after do_extension_handshake)
+        self.remote_supports_extensions: bool = False
+        self._peer_ext_ids: dict[bytes, int] = {}  # extension name -> peer's msg id
+        self.metadata_size: int = 0                # peer-reported info dict size
+
     # ------------------------------------------------------------------
     # Construction helpers
     # ------------------------------------------------------------------
@@ -74,8 +83,16 @@ class PeerConnection:
         peer_id: bytes,
         *,
         timeout: float = 10.0,
+        extension_protocol: bool = False,
     ) -> "PeerConnection":
         """Connect to *host*:*port* and complete the handshake.
+
+        Args:
+            extension_protocol: Advertise BEP 10 extension protocol support
+                                 in the reserved bytes.  Check
+                                 ``conn.remote_supports_extensions`` afterwards,
+                                 then call ``conn.do_extension_handshake()`` to
+                                 negotiate specific extensions.
 
         Raises PeerError on connection failure or handshake mismatch.
         """
@@ -90,7 +107,7 @@ class PeerConnection:
 
         conn._reader = reader
         conn._writer = writer
-        await conn._handshake(info_hash, peer_id)
+        await conn._handshake(info_hash, peer_id, extension_protocol=extension_protocol)
         return conn
 
     @classmethod
@@ -111,9 +128,20 @@ class PeerConnection:
     # Handshake
     # ------------------------------------------------------------------
 
-    async def _handshake(self, info_hash: bytes, peer_id: bytes) -> None:
+    async def _handshake(
+        self,
+        info_hash: bytes,
+        peer_id: bytes,
+        *,
+        extension_protocol: bool = False,
+    ) -> None:
         """Send our handshake and validate the peer's response."""
-        await self._send_raw(encode_handshake(info_hash, peer_id))
+        if extension_protocol:
+            await self._send_raw(
+                encode_handshake(info_hash, peer_id, reserved=EXT_PROTOCOL_RESERVED)
+            )
+        else:
+            await self._send_raw(encode_handshake(info_hash, peer_id))
 
         try:
             data = await asyncio.wait_for(
@@ -128,7 +156,7 @@ class PeerConnection:
             raise PeerError(f"Handshake failed: {exc}") from exc
 
         try:
-            their_hash, their_id = decode_handshake(data)
+            their_hash, their_id, their_reserved = decode_handshake_full(data)
         except Exception as exc:
             raise PeerError(f"Bad handshake from peer: {exc}") from exc
 
@@ -139,8 +167,10 @@ class PeerConnection:
             )
 
         self.remote_peer_id = their_id
-        log.debug("Handshake OK with %s:%s peer_id=%s", self.host, self.port,
-                  their_id.hex())
+        self.remote_supports_extensions = supports_extension_protocol(their_reserved)
+        log.debug("Handshake OK with %s:%s peer_id=%s ext=%s",
+                  self.host, self.port, their_id.hex(),
+                  self.remote_supports_extensions)
 
         # Peers often send a BITFIELD immediately after their handshake.
         # Read it if present (it's optional per BEP 3).
@@ -288,6 +318,96 @@ class PeerConnection:
         if byte_index >= len(self.bitfield):
             return False
         return bool(self.bitfield[byte_index] & (1 << bit_offset))
+
+    # ------------------------------------------------------------------
+    # BEP 10 extension protocol
+    # ------------------------------------------------------------------
+
+    async def do_extension_handshake(
+        self,
+        extensions: dict[bytes, int],
+        *,
+        timeout: float = 15.0,
+    ) -> None:
+        """Send and receive the BEP 10 extension handshake.
+
+        Sends our extension capabilities and parses the peer's response.
+        After this call, ``peer_ext_id(name)`` and ``self.metadata_size``
+        are populated.
+
+        Args:
+            extensions: Extension names we support, e.g. ``{b"ut_metadata": 1}``.
+                        The value is the local message ID we assign.
+            timeout:    Seconds to wait for the peer's extension handshake.
+        """
+        from bittorrent.bencode import encode as _bencode, decode as _bdecode
+
+        payload = _bencode({b"m": extensions})
+        await self._send_raw(encode_extended(0, payload))
+
+        deferred: list[PeerMessage] = []
+        deadline = asyncio.get_event_loop().time() + timeout
+        try:
+            while True:
+                remaining = deadline - asyncio.get_event_loop().time()
+                if remaining <= 0:
+                    raise PeerError("Extension handshake timed out")
+                try:
+                    msg = await asyncio.wait_for(self._read_next(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    raise PeerError("Extension handshake timed out")
+
+                if (msg.msg_id == MSG_EXTENDED
+                        and msg.payload
+                        and msg.payload[0] == 0):
+                    # Extension handshake response
+                    try:
+                        d = _bdecode(msg.payload[1:])
+                    except Exception as exc:
+                        raise PeerError(
+                            f"Cannot decode extension handshake: {exc}"
+                        ) from exc
+                    if isinstance(d, dict):
+                        m = d.get(b"m")
+                        if isinstance(m, dict):
+                            self._peer_ext_ids = {
+                                k: v for k, v in m.items()
+                                if isinstance(k, bytes) and isinstance(v, int)
+                            }
+                        sz = d.get(b"metadata_size")
+                        if isinstance(sz, int):
+                            self.metadata_size = sz
+                    return
+                elif msg.msg_id == MSG_BITFIELD:
+                    self.bitfield = bytearray(msg.payload)
+                else:
+                    deferred.append(msg)
+        finally:
+            # Restore any messages we skipped over
+            self._pending = deferred + self._pending
+
+    def peer_ext_id(self, name: bytes) -> int | None:
+        """Return the peer's message ID for *name*, or None if not supported."""
+        val = self._peer_ext_ids.get(name)
+        return val if isinstance(val, int) else None
+
+    async def send_extension(self, ext_id: int, payload: bytes) -> None:
+        """Send a BEP 10 extended message with *ext_id* and *payload*."""
+        await self._send_raw(encode_extended(ext_id, payload))
+
+    async def read_extension_payload(self) -> tuple[int, bytes]:
+        """Read the next MSG_EXTENDED from this peer, skipping other messages.
+
+        Returns (ext_id, raw_payload) where raw_payload follows the ext_id byte.
+        Raises PeerError on connection close.
+        """
+        while True:
+            msg = await self._read_next()
+            if msg.msg_id == MSG_EXTENDED:
+                if not msg.payload:
+                    raise PeerError("Empty extended message")
+                return msg.payload[0], msg.payload[1:]
+            # Skip HAVE, UNCHOKE, keepalives, etc.
 
     # ------------------------------------------------------------------
     # Cleanup

@@ -35,15 +35,17 @@ uv run bittorrent <torrent_file>
 ```
 bittorrent/
 ├── __init__.py
-├── main.py           # CLI entry point
+├── main.py           # CLI entry point (accepts .torrent file or magnet URI)
 ├── bencode.py        # Bencoding encoder/decoder
 ├── torrent.py        # .torrent file parser + info_hash computation
-├── tracker.py        # HTTP tracker announce
-├── peer.py           # Single peer connection (asyncio streams)
+├── tracker.py        # HTTP + UDP tracker announce
+├── peer.py           # Single peer connection (asyncio streams, BEP 10 extensions)
 ├── peer_manager.py   # Connection pool and peer selection
 ├── piece_manager.py  # Piece/block state machine, rarest-first selection
 ├── storage.py        # Pre-allocation, random-access writes, hash verify
-└── messages.py       # Peer wire protocol message encode/decode
+├── messages.py       # Peer wire protocol message encode/decode
+├── metadata.py       # BEP 9 ut_metadata fetch
+└── magnet.py         # Magnet URI parsing + metadata resolution (BEP 9/10)
 
 tests/
 ├── test_bencode.py
@@ -68,7 +70,7 @@ Goal: parse a .torrent, announce to tracker, download one piece from one peer, v
 - [x] `peer_manager.py` — async download orchestration, peer pool, parallel download, end-game (26/26)
 - [x] `main.py` — CLI entry point (14/14)
 
-**420/420 tests passing.**
+**482/482 tests passing.**
 
 ### Phase 0 complete (MVP)
 ### Phase 1 complete (parallel peers, disconnection/timeout handling)
@@ -81,7 +83,7 @@ Goal: parse a .torrent, announce to tracker, download one piece from one peer, v
 ### Phase 4 — Stretch goals
 - [x] UDP tracker protocol (BEP 15)
 - DHT (BEP 5)
-- Magnet links (BEP 9 + BEP 10 extension protocol)
+- [x] Magnet links (BEP 9 + BEP 10 extension protocol)
 - Seeding
 
 ## Key BEP References

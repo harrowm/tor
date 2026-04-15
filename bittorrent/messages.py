@@ -35,6 +35,7 @@ MSG_BITFIELD       = 5
 MSG_REQUEST        = 6
 MSG_PIECE          = 7
 MSG_CANCEL         = 8
+MSG_EXTENDED       = 20   # BEP 10 extension protocol
 
 _MSG_NAMES = {
     0: "CHOKE",
@@ -46,7 +47,12 @@ _MSG_NAMES = {
     6: "REQUEST",
     7: "PIECE",
     8: "CANCEL",
+    20: "EXTENDED",
 }
+
+# BEP 10: extension protocol bit is bit 20 from the right in the 8-byte
+# reserved field, which maps to reserved[5] & 0x10.
+EXT_PROTOCOL_RESERVED = b"\x00\x00\x00\x00\x00\x10\x00\x00"
 
 # Handshake
 _PROTOCOL_STRING = b"BitTorrent protocol"
@@ -63,19 +69,42 @@ class MessageError(Exception):
 # Handshake
 # ---------------------------------------------------------------------------
 
-def encode_handshake(info_hash: bytes, peer_id: bytes) -> bytes:
-    """Return the 68-byte handshake payload."""
+def encode_handshake(
+    info_hash: bytes,
+    peer_id: bytes,
+    *,
+    reserved: bytes = _RESERVED_BYTES,
+) -> bytes:
+    """Return the 68-byte handshake payload.
+
+    Args:
+        reserved: 8-byte reserved field (default: all zeros).
+                  Pass EXT_PROTOCOL_RESERVED to advertise BEP 10 support.
+    """
     if len(info_hash) != 20:
         raise ValueError(f"info_hash must be 20 bytes, got {len(info_hash)}")
     if len(peer_id) != 20:
         raise ValueError(f"peer_id must be 20 bytes, got {len(peer_id)}")
-    return _HANDSHAKE_PREFIX + _RESERVED_BYTES + info_hash + peer_id
+    if len(reserved) != 8:
+        raise ValueError(f"reserved must be 8 bytes, got {len(reserved)}")
+    return _HANDSHAKE_PREFIX + reserved + info_hash + peer_id
 
 
 def decode_handshake(data: bytes) -> tuple[bytes, bytes]:
     """Parse a 68-byte handshake payload.
 
-    Returns (info_hash, peer_id).
+    Returns (info_hash, peer_id).  Use decode_handshake_full() to also get
+    the reserved bytes (needed to detect BEP 10 support).
+    Raises MessageError if the data is malformed.
+    """
+    info_hash, peer_id, _ = decode_handshake_full(data)
+    return info_hash, peer_id
+
+
+def decode_handshake_full(data: bytes) -> tuple[bytes, bytes, bytes]:
+    """Parse a 68-byte handshake payload.
+
+    Returns (info_hash, peer_id, reserved).
     Raises MessageError if the data is malformed.
     """
     if len(data) < HANDSHAKE_LEN:
@@ -88,10 +117,26 @@ def decode_handshake(data: bytes) -> tuple[bytes, bytes]:
     pstr = data[1:20]
     if pstr != _PROTOCOL_STRING:
         raise MessageError(f"Unexpected protocol string: {pstr!r}")
-    # bytes 20-27: reserved (ignored for now)
+    reserved  = data[20:28]
     info_hash = data[28:48]
     peer_id   = data[48:68]
-    return info_hash, peer_id
+    return info_hash, peer_id, reserved
+
+
+def supports_extension_protocol(reserved: bytes) -> bool:
+    """Return True if the reserved bytes indicate BEP 10 extension protocol support."""
+    return len(reserved) >= 6 and bool(reserved[5] & 0x10)
+
+
+def encode_extended(ext_id: int, payload: bytes) -> bytes:
+    """Encode a BEP 10 extended message (message ID 20).
+
+    Args:
+        ext_id:  Extension message ID (0 for the extension handshake).
+        payload: Raw bytes (typically a bencoded dict for the handshake,
+                 or bencoded dict + raw data for ut_metadata).
+    """
+    return _encode(MSG_EXTENDED, bytes([ext_id]) + payload)
 
 
 # ---------------------------------------------------------------------------
