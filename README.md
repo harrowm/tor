@@ -1,6 +1,6 @@
 # tor
 
-A BitTorrent client built from scratch in Python. I wrote this to actually understand how BitTorrent works — the protocol, the peer wire format, async I/O, all of it. No libtorrent, no shortcuts.
+A BitTorrent client built from scratch in Python. I used Claude to write this to actually understand how BitTorrent works — the protocol, the peer wire format, async I/O, all of it. No libtorrent, no shortcuts.
 
 ## What it does
 
