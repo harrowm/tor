@@ -131,6 +131,7 @@ class TestRunSuccess:
             instance.run = AsyncMock()
             MockPM.return_value = instance
 
+            args.leech = True   # don't start seeder in test
             code = await _run(args)
 
         instance.run.assert_called_once()

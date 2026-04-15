@@ -684,3 +684,67 @@ class TestAnnounceUdp:
         )
         assert all(h == "opentracker.example.org" for h, _ in calls)
         assert all(p == 6969 for _, p in calls)
+
+
+# ---------------------------------------------------------------------------
+# IPv6 compact peers (BEP 7)
+# ---------------------------------------------------------------------------
+
+class TestParseCompactPeers6:
+    from bittorrent.tracker import _parse_compact_peers6
+
+    def test_single_ipv6_peer(self):
+        import socket
+        from bittorrent.tracker import _parse_compact_peers6
+        # ::1 (loopback) port 6881
+        addr_bytes = socket.inet_pton(socket.AF_INET6, "::1")
+        port_bytes = struct.pack("!H", 6881)
+        peers = _parse_compact_peers6(addr_bytes + port_bytes)
+        assert len(peers) == 1
+        assert peers[0] == ("::1", 6881)
+
+    def test_multiple_ipv6_peers(self):
+        import socket
+        from bittorrent.tracker import _parse_compact_peers6
+        addrs = ["::1", "::2", "2001:db8::1"]
+        ports = [6881, 6882, 6883]
+        data = b""
+        for addr, port in zip(addrs, ports):
+            data += socket.inet_pton(socket.AF_INET6, addr) + struct.pack("!H", port)
+        peers = _parse_compact_peers6(data)
+        assert len(peers) == 3
+        for i, (addr, port) in enumerate(zip(addrs, ports)):
+            # inet_ntop may normalise address representation
+            assert peers[i][1] == ports[i]
+
+    def test_empty_data_returns_empty(self):
+        from bittorrent.tracker import _parse_compact_peers6
+        assert _parse_compact_peers6(b"") == []
+
+    def test_non_multiple_of_18_raises(self):
+        from bittorrent.tracker import _parse_compact_peers6, TrackerError
+        with pytest.raises(TrackerError):
+            _parse_compact_peers6(b"\x00" * 17)
+
+    def test_peers6_in_tracker_response(self):
+        """HTTP tracker response containing peers6 key adds IPv6 peers."""
+        import socket
+        from bittorrent.bencode import encode as bencode
+        from bittorrent.tracker import _parse_response
+
+        # Build a compact IPv4 peers blob (one peer)
+        ipv4_peer = struct.pack("!BBBBH", 1, 2, 3, 4, 6881)
+        # Build a compact IPv6 peers6 blob (one peer)
+        ipv6_addr = socket.inet_pton(socket.AF_INET6, "::1")
+        ipv6_peer = ipv6_addr + struct.pack("!H", 6882)
+
+        body = bencode({
+            b"interval": 1800,
+            b"peers":    ipv4_peer,
+            b"peers6":   ipv6_peer,
+        })
+        resp = _parse_response(body)
+        ips = [ip for ip, _ in resp.peers]
+        assert "1.2.3.4" in ips
+        assert "::1" in ips
+        assert len(resp.peers) == 2

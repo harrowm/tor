@@ -204,6 +204,19 @@ class PieceManager:
         # rarest_first: prefer pieces fewest peers have, break ties by index
         return min(candidates, key=lambda i: (self._availability[i], i))
 
+    def bitfield_bytes(self) -> bytearray:
+        """Return our completion state as a packed bitfield (one bit per piece).
+
+        Bit 7 (MSB) of byte 0 = piece 0; bit 6 = piece 1; etc.
+        The bytearray is padded to the nearest byte with trailing zero bits.
+        """
+        num_bytes = (self._num_pieces + 7) // 8
+        bf = bytearray(num_bytes)
+        for i in range(self._num_pieces):
+            if self._state[i] == PieceState.COMPLETE:
+                bf[i // 8] |= 0x80 >> (i % 8)
+        return bf
+
     def progress(self) -> tuple[int, int]:
         """Return (num_complete, num_pieces)."""
         return self.num_complete, self._num_pieces

@@ -29,14 +29,22 @@ from bittorrent.messages import (
     MSG_CHOKE,
     MSG_EXTENDED,
     MSG_HAVE,
+    MSG_INTERESTED,
+    MSG_NOT_INTERESTED,
     MSG_PIECE,
+    MSG_REQUEST,
     MSG_UNCHOKE,
     PeerMessage,
     decode_handshake_full,
+    encode_bitfield,
+    encode_choke,
     encode_extended,
     encode_handshake,
+    encode_have,
     encode_interested,
+    encode_piece,
     encode_request,
+    encode_unchoke,
     read_message,
     supports_extension_protocol,
 )
@@ -61,7 +69,9 @@ class PeerConnection:
 
         # State set after handshake / initial message exchange
         self.remote_peer_id: bytes | None = None
-        self.am_choked: bool = True
+        self.am_choked: bool = True          # we are choked by the remote peer
+        self.am_choking: bool = True         # we are choking the remote peer
+        self.peer_interested: bool = False   # remote peer has expressed interest in us
         self.bitfield: bytearray = bytearray()   # one bit per piece
         self._pending: list[PeerMessage] = []    # messages read ahead, not yet consumed
 
@@ -151,6 +161,116 @@ class PeerConnection:
         conn = cls._from_streams(host, port, reader, writer)
         await conn._handshake(info_hash, peer_id, extension_protocol=extension_protocol)
         return conn
+
+    @classmethod
+    async def accept(
+        cls,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        info_hash: bytes,
+        peer_id: bytes,
+        *,
+        extension_protocol: bool = False,
+    ) -> "PeerConnection":
+        """Accept an incoming peer connection.
+
+        Reads the remote handshake first, validates the info_hash, then sends
+        our handshake back.  This is the mirror image of ``open()``.
+
+        Raises PeerError if the remote handshake is invalid or info_hash mismatches.
+        """
+        try:
+            data = await asyncio.wait_for(
+                reader.readexactly(HANDSHAKE_LEN),
+                timeout=10.0,
+            )
+        except asyncio.IncompleteReadError as exc:
+            raise PeerError("Peer closed connection during handshake") from exc
+        except asyncio.TimeoutError:
+            raise PeerError("Incoming handshake timed out")
+
+        try:
+            their_hash, their_id, their_reserved = decode_handshake_full(data)
+        except Exception as exc:
+            raise PeerError(f"Bad incoming handshake: {exc}") from exc
+
+        if their_hash != info_hash:
+            raise PeerError(
+                f"info_hash mismatch from incoming peer: "
+                f"expected {info_hash.hex()}, got {their_hash.hex()}"
+            )
+
+        peername = writer.get_extra_info("peername", ("unknown", 0))
+        host, port = peername[0], int(peername[1])
+
+        conn = cls(host, port)
+        conn._reader = reader
+        conn._writer = writer
+        conn.remote_peer_id = their_id
+        conn.remote_supports_extensions = supports_extension_protocol(their_reserved)
+
+        if extension_protocol:
+            await conn._send_raw(
+                encode_handshake(info_hash, peer_id, reserved=EXT_PROTOCOL_RESERVED)
+            )
+        else:
+            await conn._send_raw(encode_handshake(info_hash, peer_id))
+
+        return conn
+
+    # ------------------------------------------------------------------
+    # Upload / seeding methods
+    # ------------------------------------------------------------------
+
+    async def send_have(self, piece_index: int) -> None:
+        """Send a HAVE message to notify the peer we now have *piece_index*."""
+        await self._send_raw(encode_have(piece_index))
+
+    async def send_bitfield(self, bitfield: bytes | bytearray) -> None:
+        """Send our BITFIELD to the peer."""
+        await self._send_raw(encode_bitfield(bitfield))
+
+    async def send_choke(self) -> None:
+        """Choke the remote peer (stop serving their requests)."""
+        self.am_choking = True
+        await self._send_raw(encode_choke())
+
+    async def send_unchoke(self) -> None:
+        """Unchoke the remote peer (allow them to request blocks)."""
+        self.am_choking = False
+        await self._send_raw(encode_unchoke())
+
+    async def send_piece_block(
+        self,
+        piece_index: int,
+        block_offset: int,
+        data: bytes,
+    ) -> None:
+        """Send a PIECE block in response to a REQUEST."""
+        await self._send_raw(encode_piece(piece_index, block_offset, data))
+
+    async def read_request(self) -> tuple[int, int, int]:
+        """Read the next REQUEST from this peer, skipping non-request messages.
+
+        Updates ``peer_interested`` when INTERESTED / NOT_INTERESTED arrives.
+        Returns ``(piece_index, block_offset, block_length)``.
+        Raises PeerError on connection close or error.
+        """
+        while True:
+            msg = await self._read_next()
+            if msg.msg_id == MSG_REQUEST:
+                return msg.request_fields()
+            elif msg.msg_id == MSG_INTERESTED:
+                self.peer_interested = True
+            elif msg.msg_id == MSG_NOT_INTERESTED:
+                self.peer_interested = False
+            elif msg.msg_id == MSG_HAVE:
+                self._apply_have(msg)
+            elif msg.msg_id == MSG_CHOKE:
+                self.am_choked = True
+            elif msg.msg_id == MSG_UNCHOKE:
+                self.am_choked = False
+            # keep-alives, BITFIELD updates, etc. are silently skipped
 
     # ------------------------------------------------------------------
     # Handshake

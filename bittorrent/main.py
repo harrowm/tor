@@ -75,6 +75,11 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Enable debug logging",
     )
+    parser.add_argument(
+        "--leech", "-l",
+        action="store_true",
+        help="Exit after download completes instead of seeding (default: seed)",
+    )
     return parser.parse_args(argv)
 
 
@@ -352,6 +357,26 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         return 1
 
     console.print(f"\n[bold green]Done![/bold green] Saved to: {output_dir / torrent.name}")
+
+    if not args.leech:
+        from bittorrent.seeder import Seeder
+        seeder = Seeder(
+            torrent, storage, pm,
+            info_hash=torrent.info_hash,
+            peer_id=peer_id,
+            port=args.port,
+        )
+        console.print(
+            f"\n[cyan]Seeding on port {args.port}[/cyan]  "
+            f"(Ctrl-C to stop)"
+        )
+        try:
+            await seeder.run()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            await seeder.stop()
+
     return 0
 
 

@@ -204,6 +204,11 @@ def _parse_response(body: bytes) -> TrackerResponse:
     else:
         raise TrackerError(f"Unexpected peers type: {type(peers_raw).__name__}")
 
+    # BEP 7: IPv6 compact peers (18 bytes each: 16-byte addr + 2-byte port)
+    peers6_raw = resp.get(b"peers6", b"")
+    if isinstance(peers6_raw, bytes) and peers6_raw:
+        peers.extend(_parse_compact_peers6(peers6_raw))
+
     return TrackerResponse(
         interval=interval,
         peers=peers,
@@ -223,6 +228,20 @@ def _parse_compact_peers(data: bytes) -> list[tuple[str, int]]:
     for i in range(0, len(data), 6):
         ip = ".".join(str(b) for b in data[i : i + 4])
         (port,) = struct.unpack("!H", data[i + 4 : i + 6])
+        peers.append((ip, port))
+    return peers
+
+
+def _parse_compact_peers6(data: bytes) -> list[tuple[str, int]]:
+    """Parse BEP 7 compact IPv6 peer list (18 bytes per peer)."""
+    if len(data) % 18 != 0:
+        raise TrackerError(
+            f"Compact peers6 data length {len(data)} is not a multiple of 18"
+        )
+    peers: list[tuple[str, int]] = []
+    for i in range(0, len(data), 18):
+        ip = socket.inet_ntop(socket.AF_INET6, data[i : i + 16])
+        (port,) = struct.unpack("!H", data[i + 16 : i + 18])
         peers.append((ip, port))
     return peers
 

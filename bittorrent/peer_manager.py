@@ -19,7 +19,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 
-from bittorrent.messages import MSG_EXTENDED, PEX_LOCAL_ID, decode_pex_peers
+from bittorrent.messages import MSG_EXTENDED, PEX_LOCAL_ID, decode_pex_peers, encode_keepalive
 from bittorrent.peer import PeerConnection, PeerError
 from bittorrent.piece_manager import PieceManager
 from bittorrent.storage import Storage
@@ -322,11 +322,26 @@ class PeerManager:
                 log.debug("Extension handshake failed with %s:%s: %s", host, port, exc)
                 # Non-fatal — continue without PEX
 
+        async def _keepalive_loop() -> None:
+            """Send a keep-alive every 90 s so the peer doesn't time us out."""
+            while True:
+                await asyncio.sleep(90)
+                try:
+                    await conn._send_raw(encode_keepalive())
+                except (PeerError, OSError):
+                    return
+
+        ka_task = asyncio.create_task(_keepalive_loop())
         try:
             await self._download_loop(conn, on_progress, peer_queue)
         except (PeerError, OSError) as exc:
             log.debug("Peer %s:%s error: %s", host, port, exc)
         finally:
+            ka_task.cancel()
+            try:
+                await ka_task
+            except asyncio.CancelledError:
+                pass
             self._stats.peers_active -= 1
             await conn.close()
 

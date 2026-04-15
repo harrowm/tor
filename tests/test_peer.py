@@ -24,6 +24,7 @@ from bittorrent.messages import (
     encode_choke,
     encode_handshake,
     encode_have,
+    encode_interested,
     encode_piece,
     encode_unchoke,
 )
@@ -460,3 +461,141 @@ class TestClose:
         peer   = make_peer(reader, writer)
         await peer.close()
         assert writer.closed
+
+
+# ---------------------------------------------------------------------------
+# Upload / seeding methods
+# ---------------------------------------------------------------------------
+
+class TestUploadMethods:
+    """Tests for the seeder-side PeerConnection methods."""
+
+    async def test_send_have(self):
+        reader = make_reader(b"")
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        await peer.send_have(42)
+        ids = writer.sent_ids()
+        assert MSG_HAVE in ids
+        # payload should encode piece index 42
+        msgs = writer.messages_sent()
+        have_payloads = [p for mid, p in msgs if mid == MSG_HAVE]
+        assert struct.unpack("!I", have_payloads[0])[0] == 42
+
+    async def test_send_bitfield(self):
+        reader = make_reader(b"")
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        bf = bytearray(b"\xff\x00")
+        await peer.send_bitfield(bf)
+        msgs = writer.messages_sent()
+        assert any(mid == MSG_BITFIELD for mid, _ in msgs)
+
+    async def test_send_choke_sets_am_choking(self):
+        reader = make_reader(b"")
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        peer.am_choking = False
+        await peer.send_choke()
+        assert peer.am_choking is True
+        assert MSG_CHOKE in writer.sent_ids()
+
+    async def test_send_unchoke_clears_am_choking(self):
+        reader = make_reader(b"")
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        await peer.send_unchoke()
+        assert peer.am_choking is False
+        assert MSG_UNCHOKE in writer.sent_ids()
+
+    async def test_read_request_returns_fields(self):
+        from bittorrent.messages import encode_request, MSG_INTERESTED
+        # INTERESTED first, then a REQUEST
+        msgs = (
+            encode_interested()    # sets peer_interested
+            + encode_request(5, 0, 16384)
+        )
+        reader = make_reader(msgs)
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        piece, offset, length = await peer.read_request()
+        assert piece == 5
+        assert offset == 0
+        assert length == 16384
+        assert peer.peer_interested is True
+
+    async def test_read_request_skips_non_request_messages(self):
+        from bittorrent.messages import encode_request, encode_have
+        msgs = encode_have(7) + encode_request(3, 16384, 16384)
+        reader = make_reader(msgs)
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        piece, offset, _ = await peer.read_request()
+        assert piece == 3
+        assert offset == 16384
+
+    async def test_send_piece_block(self):
+        from bittorrent.messages import MSG_PIECE
+        reader = make_reader(b"")
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        data   = b"X" * 16384
+        await peer.send_piece_block(0, 0, data)
+        assert MSG_PIECE in writer.sent_ids()
+
+
+# ---------------------------------------------------------------------------
+# Incoming handshake (accept)
+# ---------------------------------------------------------------------------
+
+class TestAccept:
+    """Tests for PeerConnection.accept() — the seeder-side handshake."""
+
+    def _make_incoming_writer(self, peername=("5.6.7.8", 12345)):
+        """A MockWriter that also supports get_extra_info('peername')."""
+        writer = MockWriter()
+        writer.get_extra_info = lambda key, default=None: (
+            peername if key == "peername" else default
+        )
+        return writer
+
+    async def test_accept_validates_info_hash(self):
+        their_hs = encode_handshake(INFO_HASH, THEIR_ID)
+        reader   = make_reader(their_hs)
+        writer   = self._make_incoming_writer()
+        conn     = await PeerConnection.accept(reader, writer, INFO_HASH, PEER_ID)
+        assert conn.remote_peer_id == THEIR_ID
+
+    async def test_accept_sends_our_handshake_back(self):
+        their_hs = encode_handshake(INFO_HASH, THEIR_ID)
+        reader   = make_reader(their_hs)
+        writer   = self._make_incoming_writer()
+        await PeerConnection.accept(reader, writer, INFO_HASH, PEER_ID)
+        # First 68 bytes written should be our handshake with correct info_hash
+        from bittorrent.messages import decode_handshake
+        sent = bytes(writer.buffer[:68])
+        got_hash, got_id = decode_handshake(sent)
+        assert got_hash == INFO_HASH
+        assert got_id == PEER_ID
+
+    async def test_accept_wrong_info_hash_raises(self):
+        wrong_hash = bytes(reversed(range(20)))
+        their_hs   = encode_handshake(wrong_hash, THEIR_ID)
+        reader     = make_reader(their_hs)
+        writer     = self._make_incoming_writer()
+        with pytest.raises(PeerError, match="info_hash mismatch"):
+            await PeerConnection.accept(reader, writer, INFO_HASH, PEER_ID)
+
+    async def test_accept_truncated_handshake_raises(self):
+        reader = make_reader(b"\x13BitTorrent prot")   # truncated
+        writer = self._make_incoming_writer()
+        with pytest.raises(PeerError):
+            await PeerConnection.accept(reader, writer, INFO_HASH, PEER_ID)
+
+    async def test_accept_stores_host_port_from_peername(self):
+        their_hs = encode_handshake(INFO_HASH, THEIR_ID)
+        reader   = make_reader(their_hs)
+        writer   = self._make_incoming_writer(("9.8.7.6", 54321))
+        conn     = await PeerConnection.accept(reader, writer, INFO_HASH, PEER_ID)
+        assert conn.host == "9.8.7.6"
+        assert conn.port == 54321

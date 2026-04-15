@@ -773,7 +773,7 @@ class TestMainMagnetDispatch:
             inst.run = AsyncMock()
             MockPM.return_value = inst
             with patch("bittorrent.main.Storage.is_complete", return_value=False):
-                args = _parse_args([f"magnet:?xt=urn:btih:{hex_hash}", "-o", str(tmp_path)])
+                args = _parse_args([f"magnet:?xt=urn:btih:{hex_hash}", "-o", str(tmp_path), "--leech"])
                 code = await _run(args)
 
         assert code == 0
