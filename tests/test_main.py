@@ -147,3 +147,125 @@ class TestRunSuccess:
         ):
             code = await _run(args)
         assert code == 0
+
+
+# ---------------------------------------------------------------------------
+# _announce_all — multi-tracker support
+# ---------------------------------------------------------------------------
+
+class TestAnnounceAll:
+    async def test_announces_to_all_trackers_in_announce_list(self, tmp_path):
+        """All trackers in announce-list are tried in addition to announce."""
+        from bittorrent.main import _announce_all
+        from bittorrent.torrent import Torrent
+        from bittorrent.tracker import TrackerResponse
+        import hashlib
+
+        torrent = Torrent(
+            announce="http://t1.example.com/announce",
+            announce_list=[
+                ["http://t2.example.com/announce"],
+                ["http://t3.example.com/announce"],
+            ],
+            info_hash=b"\x00" * 20,
+            info_hash_hex="00" * 20,
+            name="test",
+            piece_length=512,
+            piece_hashes=[hashlib.sha1(b"x").digest()],
+            length=512,
+        )
+
+        called_urls = []
+        async def fake_announce(url, *a, **kw):
+            called_urls.append(url)
+            return TrackerResponse(interval=1800, peers=[("1.2.3.4", 6881)])
+
+        from rich.console import Console
+        console = Console(stderr=True)
+        with patch("bittorrent.main.announce", new=fake_announce):
+            peers = await _announce_all(torrent, b"-BC0001-" + b"X" * 12, 6881, console)
+
+        assert "http://t1.example.com/announce" in called_urls
+        assert "http://t2.example.com/announce" in called_urls
+        assert "http://t3.example.com/announce" in called_urls
+
+    async def test_deduplicates_peers_across_trackers(self, tmp_path):
+        """Same peer returned by multiple trackers only appears once."""
+        from bittorrent.main import _announce_all
+        from bittorrent.torrent import Torrent
+        from bittorrent.tracker import TrackerResponse
+        import hashlib
+
+        torrent = Torrent(
+            announce="http://t1.example.com/announce",
+            announce_list=[["http://t2.example.com/announce"]],
+            info_hash=b"\x00" * 20,
+            info_hash_hex="00" * 20,
+            name="test",
+            piece_length=512,
+            piece_hashes=[hashlib.sha1(b"x").digest()],
+            length=512,
+        )
+
+        async def fake_announce(url, *a, **kw):
+            # Both trackers return the same peer
+            return TrackerResponse(interval=1800, peers=[("1.2.3.4", 6881)])
+
+        from rich.console import Console
+        console = Console(stderr=True)
+        with patch("bittorrent.main.announce", new=fake_announce):
+            peers = await _announce_all(torrent, b"-BC0001-" + b"X" * 12, 6881, console)
+
+        assert peers.count(("1.2.3.4", 6881)) == 1
+
+    async def test_partial_tracker_failure_still_returns_peers(self, tmp_path):
+        """If one tracker fails, peers from the others are still returned."""
+        from bittorrent.main import _announce_all
+        from bittorrent.torrent import Torrent
+        from bittorrent.tracker import TrackerResponse, TrackerError
+        import hashlib
+
+        torrent = Torrent(
+            announce="http://bad.example.com/announce",
+            announce_list=[["http://good.example.com/announce"]],
+            info_hash=b"\x00" * 20,
+            info_hash_hex="00" * 20,
+            name="test",
+            piece_length=512,
+            piece_hashes=[hashlib.sha1(b"x").digest()],
+            length=512,
+        )
+
+        async def fake_announce(url, *a, **kw):
+            if "bad" in url:
+                raise TrackerError("timeout")
+            return TrackerResponse(interval=1800, peers=[("5.6.7.8", 6882)])
+
+        from rich.console import Console
+        console = Console(stderr=True)
+        with patch("bittorrent.main.announce", new=fake_announce):
+            peers = await _announce_all(torrent, b"-BC0001-" + b"X" * 12, 6881, console)
+
+        assert ("5.6.7.8", 6882) in peers
+
+    async def test_no_trackers_returns_empty(self, tmp_path):
+        """Torrent with no trackers returns empty peer list."""
+        from bittorrent.main import _announce_all
+        from bittorrent.torrent import Torrent
+        import hashlib
+
+        torrent = Torrent(
+            announce="",
+            announce_list=[],
+            info_hash=b"\x00" * 20,
+            info_hash_hex="00" * 20,
+            name="test",
+            piece_length=512,
+            piece_hashes=[hashlib.sha1(b"x").digest()],
+            length=512,
+        )
+
+        from rich.console import Console
+        console = Console(stderr=True)
+        peers = await _announce_all(torrent, b"-BC0001-" + b"X" * 12, 6881, console)
+        assert peers == []

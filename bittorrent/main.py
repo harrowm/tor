@@ -82,6 +82,56 @@ def _piece_map(fractions: list[float], width: int) -> Text:
     return text
 
 
+async def _announce_all(
+    torrent: "Torrent",
+    peer_id: bytes,
+    port: int,
+    console: Console,
+) -> list[tuple[str, int]]:
+    """Announce to every tracker in announce + announce-list concurrently.
+
+    Returns a deduplicated list of (ip, port) peers gathered from all
+    trackers that responded successfully.  Tracker failures are logged
+    but never fatal — we simply skip that tracker.
+    """
+    # Build a deduplicated ordered list of all tracker URLs.
+    seen_urls: set[str] = set()
+    trackers: list[str] = []
+    for url in [torrent.announce] + [u for tier in torrent.announce_list for u in tier]:
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            trackers.append(url)
+
+    if not trackers:
+        return []
+
+    console.print(f"\nAnnouncing to {len(trackers)} tracker(s)…")
+
+    all_peers: list[tuple[str, int]] = []
+    seen_peers: set[tuple[str, int]] = set()
+
+    async def _try(url: str) -> None:
+        try:
+            resp = await announce(
+                url, torrent.info_hash, peer_id, port,
+                left=torrent.total_length, event="started",
+            )
+            # No await between the two mutations — safe in asyncio.
+            new = [p for p in resp.peers if tuple(p) not in seen_peers]
+            seen_peers.update(tuple(p) for p in new)
+            all_peers.extend(new)
+            console.print(
+                f"  {url}: [bold]{len(resp.peers)}[/bold] peers"
+                f" (seeders={resp.complete}, leechers={resp.incomplete})"
+            )
+        except TrackerError as exc:
+            console.print(f"  [dim]{url}: {exc}[/dim]")
+
+    await asyncio.gather(*[_try(url) for url in trackers])
+    console.print(f"Total: [bold]{len(all_peers)}[/bold] unique peers")
+    return all_peers
+
+
 async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
     """Main async body. Returns exit code."""
     log = logging.getLogger(__name__)
@@ -124,33 +174,15 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         console.print(f"[bold]Name:[/bold]      {torrent.name}")
         console.print(f"[bold]Size:[/bold]      {torrent.total_length:,} bytes")
         console.print(f"[bold]Pieces:[/bold]    {torrent.num_pieces} × {torrent.piece_length:,} bytes")
+        all_trackers = len({torrent.announce} | {u for tier in torrent.announce_list for u in tier} - {""})
         console.print(f"[bold]Info hash:[/bold] {torrent.info_hash_hex}")
-        console.print(f"[bold]Tracker:[/bold]   {torrent.announce}")
+        console.print(f"[bold]Trackers:[/bold]  {all_trackers}")
         peers = []  # populated below
 
-    # --- Announce to tracker ---
-    if torrent.announce:
-        console.print("\nAnnouncing to tracker…")
-        try:
-            response = await announce(
-                torrent.announce,
-                torrent.info_hash,
-                peer_id,
-                args.port,
-                left=torrent.total_length,
-                event="started",
-            )
-        except TrackerError as exc:
-            console.print(f"[red]Tracker error:[/red] {exc}")
-            if not peers:
-                return 1
-            # For magnet flows we may already have peers; tracker failure is non-fatal
-        else:
-            peers = response.peers
-            console.print(
-                f"Got [bold]{len(peers)}[/bold] peers "
-                f"(seeders={response.complete}, leechers={response.incomplete})"
-            )
+    # --- Announce to all trackers (BEP 12) ---
+    extra_peers = await _announce_all(torrent, peer_id, args.port, console)
+    peers = list({*map(tuple, peers), *map(tuple, extra_peers)})  # deduplicate
+    peers = [tuple(p) for p in peers]  # ensure list[tuple[str,int]]
 
     if not peers:
         console.print("[red]No peers — cannot download.[/red]")
