@@ -89,12 +89,16 @@ def parse(data: bytes) -> Torrent:
     if not isinstance(meta, dict):
         raise ParseError("Torrent file must be a bencoded dict at the top level")
 
-    # --- announce ---
-    announce_raw = _require(meta, b"announce", bytes, "announce")
-    try:
-        announce = announce_raw.decode("utf-8")
-    except UnicodeDecodeError:
-        raise ParseError("announce URL is not valid UTF-8")
+    # --- announce (optional per BEP 12 — may be absent in trackerless torrents) ---
+    announce = ""
+    if b"announce" in meta:
+        announce_raw = meta[b"announce"]
+        if not isinstance(announce_raw, bytes):
+            raise ParseError("'announce' must be a byte string")
+        try:
+            announce = announce_raw.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ParseError("announce URL is not valid UTF-8")
 
     # --- announce-list (BEP 12, optional) ---
     announce_list: list[list[str]] = []
@@ -111,6 +115,11 @@ def parse(data: bytes) -> Torrent:
                     raise ParseError("announce-list URLs must be byte strings")
                 decoded_tier.append(url.decode("utf-8"))
             announce_list.append(decoded_tier)
+
+    # If announce is absent but announce-list is present, use the first entry
+    # so the rest of the code always has a primary tracker URL to work with.
+    if not announce and announce_list:
+        announce = announce_list[0][0] if announce_list[0] else ""
 
     # --- info dict ---
     if b"info" not in meta:

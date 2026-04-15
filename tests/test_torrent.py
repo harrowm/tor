@@ -255,7 +255,9 @@ class TestParseErrors:
         with pytest.raises(ParseError):
             parse(encode([1, 2, 3]))
 
-    def test_missing_announce(self):
+    def test_missing_announce_defaults_to_empty(self):
+        # BEP 12: announce is optional; trackerless / announce-list-only torrents
+        # should parse successfully with announce defaulting to "".
         data = encode({
             b"info": {
                 b"length": 100,
@@ -264,8 +266,22 @@ class TestParseErrors:
                 b"pieces": make_pieces(1),
             }
         })
-        with pytest.raises(ParseError, match="announce"):
-            parse(data)
+        t = parse(data)
+        assert t.announce == ""
+
+    def test_missing_announce_falls_back_to_announce_list(self):
+        # When announce is absent but announce-list is present, use first entry.
+        data = encode({
+            b"announce-list": [[b"http://tracker.example.com/announce"]],
+            b"info": {
+                b"length": 100,
+                b"name": b"x",
+                b"piece length": 512,
+                b"pieces": make_pieces(1),
+            }
+        })
+        t = parse(data)
+        assert t.announce == "http://tracker.example.com/announce"
 
     def test_missing_info(self):
         data = encode({b"announce": b"http://x.com"})
