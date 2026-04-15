@@ -712,3 +712,41 @@ class TestEndGame:
             await manager.run([("1.2.3.4", 6881)])
 
         assert pm.is_complete()
+
+
+# ---------------------------------------------------------------------------
+# No-bitfield peers (seeder that skips BITFIELD message)
+# ---------------------------------------------------------------------------
+
+class TestNoBitfield:
+    async def test_peer_with_no_bitfield_downloads_all_pieces(self, tmp_path):
+        """A peer that sends no BITFIELD (empty bytearray) should be treated
+        as able to serve any piece — common for seeders."""
+        pieces  = make_pieces(4)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        # bitfield=b"" simulates a peer that never sent a BITFIELD message
+        fake = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"")
+        with patch_open(fake):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert pm.is_complete()
+        for i, expected in enumerate(pieces):
+            assert storage.read_piece(i) == expected
+
+    async def test_peer_with_empty_bitfield_serves_all_pieces(self, tmp_path):
+        """Explicitly confirm empty bitfield => None passed to next_piece => any piece eligible."""
+        pieces  = make_pieces(2)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = make_manager(torrent, pm, storage)
+
+        fake = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"")
+        with patch_open(fake):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert pm.num_complete == 2

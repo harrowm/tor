@@ -211,7 +211,10 @@ class PeerManager:
         returns to MISSING — which would leave no worker alive to pick it up.
         """
         while not self._pm.is_complete():
-            piece_index = self._pm.next_piece(conn.bitfield)
+            # If the peer sent no BITFIELD, treat as "can serve any piece"
+            # (common for seeders that skip BITFIELD and just answer requests).
+            bitfield = conn.bitfield if conn.bitfield else None
+            piece_index = self._pm.next_piece(bitfield)
             if piece_index is None:
                 if self._pm.num_in_progress == 0:
                     # No MISSING pieces for this peer and nothing in-flight.
