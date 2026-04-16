@@ -381,7 +381,11 @@ class TestParallelDownload:
         """Under concurrent peers, no piece should be downloaded more than once."""
         pieces  = make_pieces(4)
         torrent = make_torrent(pieces)
-        pm      = make_pm(torrent)
+        # Disable end-game (threshold=0) so each piece is only given to one worker.
+        # End-game intentionally allows in-progress pieces to be sent to multiple
+        # workers; this test is checking normal (non-end-game) behaviour.
+        pm      = PieceManager(torrent.num_pieces, torrent.piece_length,
+                               torrent.total_length, end_game_threshold=0)
         storage = make_storage(torrent, tmp_path)
         manager = make_manager(torrent, pm, storage)
 

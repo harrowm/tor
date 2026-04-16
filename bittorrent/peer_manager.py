@@ -238,8 +238,9 @@ class PeerManager:
                 await asyncio.sleep(1.0)   # back off briefly before retrying
                 continue
 
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._storage.write_piece, piece_index, data)
             already_complete = self._pm.is_complete_piece(piece_index)
-            self._storage.write_piece(piece_index, data)
             self._pm.mark_complete(piece_index)
 
             if not already_complete:
@@ -435,12 +436,14 @@ class PeerManager:
             # Process any PEX messages that arrived during the piece download
             self._drain_pex(conn, peer_queue)
 
-            # In end-game mode two workers may race on the same piece.
-            # Check before marking complete so stats are only updated once.
-            # This is safe: no await between the check and mark_complete, so
-            # no other coroutine can slip in between them.
+            # Write to disk off the event loop so we don't freeze the display
+            # (synchronous file I/O can stall for 100s of ms on macOS Spotlight).
+            # Two workers may race and both write the same data — that is
+            # idempotent.  The check→mark_complete pair below has no await
+            # between them so the "already complete" stat is still counted once.
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._storage.write_piece, piece_index, data)
             already_complete = self._pm.is_complete_piece(piece_index)
-            self._storage.write_piece(piece_index, data)
             self._pm.mark_complete(piece_index)
 
             if not already_complete:
