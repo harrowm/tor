@@ -375,15 +375,22 @@ async def _udp_transact(
     """
     loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
+        # Prefer IPv4 — some trackers have both A and AAAA records, and using
+        # an IPv6 address with an AF_INET socket causes errno 8 (EAI_NONAME).
+        infos = await loop.getaddrinfo(
+            host, port, family=socket.AF_INET, type=socket.SOCK_DGRAM
+        )
+        if not infos:
+            infos = await loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM)
     except OSError as exc:
         raise TrackerError(f"Cannot resolve UDP tracker {host!r}: {exc}") from exc
     if not infos:
         raise TrackerError(f"Cannot resolve UDP tracker {host!r}")
 
-    addr = infos[0][4][:2]   # (ip_string, port)
+    af, _, _, _, sockaddr = infos[0]
+    addr = sockaddr[:2]   # (ip_string, port)
 
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock = socket.socket(af, socket.SOCK_DGRAM)
     sock.setblocking(False)
     try:
         await asyncio.wait_for(loop.sock_sendto(sock, request, addr), timeout=timeout)
