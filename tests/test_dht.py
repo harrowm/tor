@@ -26,7 +26,9 @@ from bittorrent.dht import (
     KBucket,
     RoutingTable,
     decode_compact_nodes,
+    decode_compact_nodes6,
     decode_compact_peers,
+    decode_compact_peers6,
     decode_response,
     encode_compact_nodes,
     encode_find_node,
@@ -697,3 +699,150 @@ class TestDHTClientContextManager:
                 pass
 
             assert dht._transport is None
+
+
+# ---------------------------------------------------------------------------
+# BEP 32 — DHT IPv6
+# ---------------------------------------------------------------------------
+
+class TestDHTIPv6:
+    """Tests for BEP 32 IPv6 compact node/peer formats."""
+
+    def _compact_node6(self, node_id: bytes, ip6: str, port: int) -> bytes:
+        import socket
+        return node_id + socket.inet_pton(socket.AF_INET6, ip6) + struct.pack("!H", port)
+
+    def _compact_peer6(self, ip6: str, port: int) -> bytes:
+        import socket
+        return socket.inet_pton(socket.AF_INET6, ip6) + struct.pack("!H", port)
+
+    def test_decode_compact_nodes6_single(self):
+        node_id = bytes(range(20))
+        raw = self._compact_node6(node_id, "::1", 6881)
+        nodes = decode_compact_nodes6(raw)
+        assert len(nodes) == 1
+        assert nodes[0].id == node_id
+        assert nodes[0].port == 6881
+        assert "::1" in nodes[0].host or nodes[0].host == "::1"
+
+    def test_decode_compact_nodes6_multiple(self):
+        id1 = bytes([1]) * 20
+        id2 = bytes([2]) * 20
+        raw = (
+            self._compact_node6(id1, "2001:db8::1", 6881) +
+            self._compact_node6(id2, "2001:db8::2", 6882)
+        )
+        nodes = decode_compact_nodes6(raw)
+        assert len(nodes) == 2
+        assert nodes[0].id == id1
+        assert nodes[1].id == id2
+
+    def test_decode_compact_nodes6_wrong_length_raises(self):
+        with pytest.raises(ValueError, match="38"):
+            decode_compact_nodes6(b"\x00" * 37)
+
+    def test_decode_compact_peers6_single(self):
+        raw = self._compact_peer6("::1", 6881)
+        peers = decode_compact_peers6(raw)
+        assert len(peers) == 1
+        assert peers[0][1] == 6881
+
+    def test_decode_compact_peers6_multiple(self):
+        raw = (
+            self._compact_peer6("2001:db8::1", 1111) +
+            self._compact_peer6("2001:db8::2", 2222)
+        )
+        peers = decode_compact_peers6(raw)
+        assert len(peers) == 2
+        assert peers[0][1] == 1111
+        assert peers[1][1] == 2222
+
+    def test_decode_compact_peers6_wrong_length_raises(self):
+        with pytest.raises(ValueError, match="18"):
+            decode_compact_peers6(b"\x00" * 17)
+
+    def test_decode_compact_peers6_empty(self):
+        assert decode_compact_peers6(b"") == []
+
+    async def test_get_peers_reads_values6(self):
+        """get_peers includes IPv6 peers from the 'values6' field."""
+        import socket
+        from unittest.mock import AsyncMock, MagicMock, patch
+        from bittorrent.bencode import encode
+        from bittorrent.dht import DHTClient, DHTNode, DHTTransport, decode_compact_nodes
+
+        node_id = bytes(range(20))
+        our_id  = bytes([0]) * 20
+
+        ip6    = "2001:db8::42"
+        port   = 6882
+        peer6  = socket.inet_pton(socket.AF_INET6, ip6) + struct.pack("!H", port)
+
+        # Build a get_peers response with values6 and no values
+        resp = encode({
+            b"t": b"\x00\x01",
+            b"y": b"r",
+            b"r": {
+                b"id": node_id,
+                b"token": b"tok",
+                b"values6": peer6,
+            },
+        })
+
+        mock_transport = MagicMock(spec=DHTTransport)
+        async def fake_request(data, addr, txid, *, timeout=3.0):
+            import bittorrent.bencode as _bc
+            msg = _bc.decode(data)
+            return _bc.decode(resp), addr
+        mock_transport.request = fake_request
+
+        with patch("bittorrent.dht.create_dht_transport", return_value=mock_transport):
+            async with DHTClient(node_id=our_id) as dht:
+                seed = DHTNode(id=node_id, host="1.2.3.4", port=6881)
+                dht._table.add(seed)
+                peers = await dht.get_peers(bytes([0xff]) * 20, timeout=5.0)
+
+        assert any(p[1] == port for p in peers), f"IPv6 peer port {port} not in {peers}"
+
+    async def test_get_peers_reads_nodes6(self):
+        """Nodes from 'nodes6' are added to the routing table during lookup."""
+        import socket
+        from unittest.mock import MagicMock, patch
+        from bittorrent.bencode import encode
+        from bittorrent.dht import DHTClient, DHTNode, DHTTransport
+
+        seed_id  = bytes([0xaa]) * 20
+        node6_id = bytes([0xbb]) * 20
+        our_id   = bytes([0x00]) * 20
+
+        nodes6_raw = node6_id + socket.inet_pton(socket.AF_INET6, "::1") + struct.pack("!H", 9999)
+
+        resp = encode({
+            b"t": b"\x00\x01",
+            b"y": b"r",
+            b"r": {
+                b"id": seed_id,
+                b"token": b"tok",
+                b"nodes6": nodes6_raw,
+            },
+        })
+
+        call_count = [0]
+        async def fake_request(data, addr, txid, *, timeout=3.0):
+            import bittorrent.bencode as _bc
+            call_count[0] += 1
+            return _bc.decode(resp), addr
+
+        mock_transport = MagicMock(spec=DHTTransport)
+        mock_transport.request = fake_request
+
+        with patch("bittorrent.dht.create_dht_transport", return_value=mock_transport):
+            async with DHTClient(node_id=our_id) as dht:
+                seed = DHTNode(id=seed_id, host="1.2.3.4", port=6881)
+                dht._table.add(seed)
+                await dht.get_peers(bytes([0xff]) * 20, timeout=5.0)
+
+        # The node discovered via nodes6 should be in the routing table
+        all_nodes = dht._table.find_closest(bytes([0xbb]) * 20, 20)
+        assert any(n.id == node6_id for n in all_nodes), \
+            f"nodes6 node {node6_id.hex()} not in routing table"

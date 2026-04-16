@@ -25,6 +25,7 @@ import asyncio
 import hashlib
 import logging
 import os
+import socket
 import struct
 import time
 from dataclasses import dataclass, field
@@ -107,6 +108,33 @@ def decode_compact_peers(data: bytes) -> list[tuple[str, int]]:
         chunk = data[i : i + 6]
         host = ".".join(str(b) for b in chunk[:4])
         port = struct.unpack("!H", chunk[4:6])[0]
+        peers.append((host, port))
+    return peers
+
+
+def decode_compact_nodes6(data: bytes) -> list["DHTNode"]:
+    """BEP 32: decode compact IPv6 node list (38 bytes per node: 20-byte ID + 16-byte IPv6 + 2-byte port)."""
+    if len(data) % 38 != 0:
+        raise ValueError(f"Compact nodes6 length {len(data)} is not a multiple of 38")
+    nodes = []
+    for i in range(0, len(data), 38):
+        chunk   = data[i : i + 38]
+        node_id = chunk[:20]
+        host    = socket.inet_ntop(socket.AF_INET6, chunk[20:36])
+        port    = struct.unpack("!H", chunk[36:38])[0]
+        nodes.append(DHTNode(id=node_id, host=host, port=port))
+    return nodes
+
+
+def decode_compact_peers6(data: bytes) -> list[tuple[str, int]]:
+    """BEP 32: decode compact IPv6 peer list (18 bytes per peer: 16-byte IPv6 + 2-byte port)."""
+    if len(data) % 18 != 0:
+        raise ValueError(f"Compact peers6 length {len(data)} is not a multiple of 18")
+    peers = []
+    for i in range(0, len(data), 18):
+        chunk = data[i : i + 18]
+        host  = socket.inet_ntop(socket.AF_INET6, chunk[:16])
+        port  = struct.unpack("!H", chunk[16:18])[0]
         peers.append((host, port))
     return peers
 
@@ -506,13 +534,21 @@ class DHTClient:
         if len(node_id) == 20:
             self._table.add(DHTNode(id=node_id, host=node.host, port=node.port))
 
+        nodes: list[DHTNode] = []
         raw_nodes = r.get(b"nodes", b"")
         if isinstance(raw_nodes, bytes) and raw_nodes:
             try:
-                return decode_compact_nodes(raw_nodes)
+                nodes.extend(decode_compact_nodes(raw_nodes))
             except ValueError:
                 pass
-        return []
+        # BEP 32: also handle IPv6 nodes in find_node responses
+        raw_nodes6 = r.get(b"nodes6", b"")
+        if isinstance(raw_nodes6, bytes) and raw_nodes6 and len(raw_nodes6) % 38 == 0:
+            try:
+                nodes.extend(decode_compact_nodes6(raw_nodes6))
+            except ValueError:
+                pass
+        return nodes
 
     # ------------------------------------------------------------------
     # get_peers (the main API)
@@ -626,9 +662,23 @@ class DHTClient:
                             peers.extend(decode_compact_peers(item))
                         except ValueError:
                             pass
+                    elif isinstance(item, bytes) and len(item) == 18:
+                        try:
+                            peers.extend(decode_compact_peers6(item))
+                        except ValueError:
+                            pass
             elif isinstance(raw_values, bytes):
                 try:
                     peers.extend(decode_compact_peers(raw_values))
+                except ValueError:
+                    pass
+
+        # BEP 32: also read IPv6 peers
+        if b"values6" in r:
+            raw6 = r[b"values6"]
+            if isinstance(raw6, bytes) and raw6 and len(raw6) % 18 == 0:
+                try:
+                    peers.extend(decode_compact_peers6(raw6))
                 except ValueError:
                     pass
 
@@ -637,6 +687,14 @@ class DHTClient:
         if isinstance(raw_nodes, bytes) and raw_nodes:
             try:
                 nodes = decode_compact_nodes(raw_nodes)
+            except ValueError:
+                pass
+
+        # BEP 32: also read IPv6 nodes from get_peers response
+        raw_nodes6 = r.get(b"nodes6", b"")
+        if isinstance(raw_nodes6, bytes) and raw_nodes6 and len(raw_nodes6) % 38 == 0:
+            try:
+                nodes.extend(decode_compact_nodes6(raw_nodes6))
             except ValueError:
                 pass
 

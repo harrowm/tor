@@ -7,16 +7,21 @@ The Bittorrent list of BEPs is here: https://www.bittorrent.org/beps/bep_0000.ht
 ## What it does
 
 - Downloads torrents from `.torrent` files or magnet links
-- Talks to HTTP and UDP trackers (BEP 15)
+- Talks to HTTP, HTTPS, and UDP trackers (BEP 15)
 - Connects to peers, does the handshake, downloads pieces in parallel
 - Verifies every piece with SHA-1 before writing to disk
 - Resumes partial downloads
 - Multi-file torrents with pieces that span file boundaries
-- Rarest-first piece selection, end-game mode
-- DHT peer discovery (BEP 5) — finds peers without a tracker
+- Rarest-first piece selection, end-game mode with CANCEL messages (BEP 6)
+- Fast Extension (BEP 6) — HAVE_ALL/HAVE_NONE, REJECT_REQUEST for seeders
+- DHT peer discovery (BEP 5) — finds peers without a tracker, including IPv6 (BEP 32)
+- Local Service Discovery (BEP 14) — finds peers on the same LAN via multicast
 - Peer Exchange / PEX (BEP 11) — peers share their peer lists
 - uTP transport (BEP 29) — falls back to UDP if TCP is blocked
 - Web seeds (BEP 19) — fetches pieces from HTTP servers when peers are slow
+- Seeding with tit-for-tat choke/unchoke (BEP 3), upload slots, optimistic unchoke
+- Sends completed/stopped events to trackers on download finish and exit
+- Clean shutdown on SIGINT/SIGTERM with tracker notification
 
 ## Usage
 

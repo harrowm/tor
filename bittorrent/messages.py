@@ -1,5 +1,5 @@
 """
-Peer wire protocol message encoding and decoding (BEP 3).
+Peer wire protocol message encoding and decoding (BEP 3 + BEP 6).
 
 Wire format:
   Keep-alive:  \x00\x00\x00\x00                     (4 bytes, length=0)
@@ -11,6 +11,12 @@ Handshake (special — sent before the message loop):
 
 Block size: always 2^14 = 16,384 bytes per request (except possibly the last
 block of a piece, which may be smaller).
+
+BEP 6 — Fast Extension:
+  Adds HAVE_ALL (0x04 in reserved[7]), HAVE_NONE, SUGGEST_PIECE,
+  REJECT_REQUEST, and ALLOWED_FAST messages.  These allow seeders to replace
+  the BITFIELD with a single HAVE_ALL message and let a peer explicitly
+  reject a request rather than silently ignoring it.
 """
 
 from __future__ import annotations
@@ -36,6 +42,12 @@ MSG_BITFIELD       = 5
 MSG_REQUEST        = 6
 MSG_PIECE          = 7
 MSG_CANCEL         = 8
+# BEP 6 — Fast Extension
+MSG_SUGGEST_PIECE  = 13
+MSG_HAVE_ALL       = 14
+MSG_HAVE_NONE      = 15
+MSG_REJECT_REQUEST = 16
+MSG_ALLOWED_FAST   = 17
 MSG_EXTENDED       = 20   # BEP 10 extension protocol
 
 _MSG_NAMES = {
@@ -48,12 +60,24 @@ _MSG_NAMES = {
     6: "REQUEST",
     7: "PIECE",
     8: "CANCEL",
+    13: "SUGGEST_PIECE",
+    14: "HAVE_ALL",
+    15: "HAVE_NONE",
+    16: "REJECT_REQUEST",
+    17: "ALLOWED_FAST",
     20: "EXTENDED",
 }
 
 # BEP 10: extension protocol bit is bit 20 from the right in the 8-byte
 # reserved field, which maps to reserved[5] & 0x10.
 EXT_PROTOCOL_RESERVED = b"\x00\x00\x00\x00\x00\x10\x00\x00"
+
+# BEP 6: Fast Extension bit is the LSB of reserved[7] (bit 2 from the right
+# of the full 64-bit reserved field).
+FAST_EXT_RESERVED = b"\x00\x00\x00\x00\x00\x00\x00\x04"
+
+# Combined reserved bytes: BEP 10 extension protocol + BEP 6 Fast Extension
+EXT_AND_FAST_RESERVED = b"\x00\x00\x00\x00\x00\x10\x00\x04"
 
 # Handshake
 _PROTOCOL_STRING = b"BitTorrent protocol"
@@ -127,6 +151,11 @@ def decode_handshake_full(data: bytes) -> tuple[bytes, bytes, bytes]:
 def supports_extension_protocol(reserved: bytes) -> bool:
     """Return True if the reserved bytes indicate BEP 10 extension protocol support."""
     return len(reserved) >= 6 and bool(reserved[5] & 0x10)
+
+
+def supports_fast_extension(reserved: bytes) -> bool:
+    """Return True if the reserved bytes indicate BEP 6 Fast Extension support."""
+    return len(reserved) >= 8 and bool(reserved[7] & 0x04)
 
 
 def encode_extended(ext_id: int, payload: bytes) -> bytes:
@@ -233,6 +262,36 @@ def encode_piece(piece_index: int, block_offset: int, data: bytes) -> bytes:
 def encode_cancel(piece_index: int, block_offset: int, block_length: int) -> bytes:
     payload = struct.pack("!III", piece_index, block_offset, block_length)
     return _encode(MSG_CANCEL, payload)
+
+
+# ---------------------------------------------------------------------------
+# BEP 6 — Fast Extension encoders
+# ---------------------------------------------------------------------------
+
+def encode_have_all() -> bytes:
+    """HAVE_ALL: peer has every piece (replaces full BITFIELD for seeders)."""
+    return _encode(MSG_HAVE_ALL)
+
+
+def encode_have_none() -> bytes:
+    """HAVE_NONE: peer has no pieces (replaces empty BITFIELD for new leechers)."""
+    return _encode(MSG_HAVE_NONE)
+
+
+def encode_suggest_piece(piece_index: int) -> bytes:
+    """SUGGEST_PIECE: advisory hint that this piece would be useful to request."""
+    return _encode(MSG_SUGGEST_PIECE, struct.pack("!I", piece_index))
+
+
+def encode_reject_request(piece_index: int, block_offset: int, block_length: int) -> bytes:
+    """REJECT_REQUEST: explicit refusal of a REQUEST (e.g. while choked)."""
+    payload = struct.pack("!III", piece_index, block_offset, block_length)
+    return _encode(MSG_REJECT_REQUEST, payload)
+
+
+def encode_allowed_fast(piece_index: int) -> bytes:
+    """ALLOWED_FAST: tell the peer it may request this piece even while choked."""
+    return _encode(MSG_ALLOWED_FAST, struct.pack("!I", piece_index))
 
 
 # ---------------------------------------------------------------------------

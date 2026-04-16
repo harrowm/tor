@@ -11,31 +11,44 @@ import pytest
 
 from bittorrent.messages import (
     BLOCK_SIZE,
+    EXT_AND_FAST_RESERVED,
+    FAST_EXT_RESERVED,
     HANDSHAKE_LEN,
+    MSG_ALLOWED_FAST,
     MSG_BITFIELD,
     MSG_CANCEL,
     MSG_CHOKE,
     MSG_HAVE,
+    MSG_HAVE_ALL,
+    MSG_HAVE_NONE,
     MSG_INTERESTED,
     MSG_NOT_INTERESTED,
     MSG_PIECE,
+    MSG_REJECT_REQUEST,
     MSG_REQUEST,
+    MSG_SUGGEST_PIECE,
     MSG_UNCHOKE,
     MessageError,
     PeerMessage,
     decode_handshake,
+    encode_allowed_fast,
     encode_bitfield,
     encode_cancel,
     encode_choke,
     encode_handshake,
     encode_have,
+    encode_have_all,
+    encode_have_none,
     encode_interested,
     encode_keepalive,
     encode_not_interested,
     encode_piece,
+    encode_reject_request,
     encode_request,
+    encode_suggest_piece,
     encode_unchoke,
     read_message,
+    supports_fast_extension,
 )
 
 
@@ -410,3 +423,94 @@ class TestReadMessage:
         assert idx    == 1
         assert offset == 16384
         assert data   == blob
+
+
+# ---------------------------------------------------------------------------
+# BEP 6 — Fast Extension
+# ---------------------------------------------------------------------------
+
+class TestFastExtension:
+    """Tests for BEP 6 Fast Extension message encoding and detection."""
+
+    def test_msg_ids_defined(self):
+        assert MSG_SUGGEST_PIECE  == 13
+        assert MSG_HAVE_ALL       == 14
+        assert MSG_HAVE_NONE      == 15
+        assert MSG_REJECT_REQUEST == 16
+        assert MSG_ALLOWED_FAST   == 17
+
+    def test_fast_reserved_bytes(self):
+        assert FAST_EXT_RESERVED[7] & 0x04
+
+    def test_ext_and_fast_reserved_bytes(self):
+        from bittorrent.messages import EXT_PROTOCOL_RESERVED
+        assert EXT_AND_FAST_RESERVED[5] & 0x10   # BEP 10 bit
+        assert EXT_AND_FAST_RESERVED[7] & 0x04   # BEP 6 bit
+
+    def test_supports_fast_extension_true(self):
+        reserved = b"\x00" * 7 + b"\x04"
+        assert supports_fast_extension(reserved) is True
+
+    def test_supports_fast_extension_false(self):
+        reserved = b"\x00" * 8
+        assert supports_fast_extension(reserved) is False
+
+    def test_supports_fast_extension_combined(self):
+        assert supports_fast_extension(EXT_AND_FAST_RESERVED) is True
+
+    def test_encode_have_all(self):
+        msg = encode_have_all()
+        assert msg == struct.pack("!IB", 1, MSG_HAVE_ALL)
+
+    def test_encode_have_none(self):
+        msg = encode_have_none()
+        assert msg == struct.pack("!IB", 1, MSG_HAVE_NONE)
+
+    def test_encode_suggest_piece(self):
+        msg = encode_suggest_piece(42)
+        assert msg == struct.pack("!IBI", 5, MSG_SUGGEST_PIECE, 42)
+
+    def test_encode_reject_request(self):
+        msg = encode_reject_request(1, 0, 16384)
+        assert msg == struct.pack("!IBIII", 13, MSG_REJECT_REQUEST, 1, 0, 16384)
+
+    def test_encode_allowed_fast(self):
+        msg = encode_allowed_fast(7)
+        assert msg == struct.pack("!IBI", 5, MSG_ALLOWED_FAST, 7)
+
+    async def test_read_have_all(self):
+        data = encode_have_all()
+        reader = make_reader(data)
+        msg = await read_message(reader)
+        assert msg.msg_id == MSG_HAVE_ALL
+        assert msg.payload == b""
+
+    async def test_read_have_none(self):
+        data = encode_have_none()
+        reader = make_reader(data)
+        msg = await read_message(reader)
+        assert msg.msg_id == MSG_HAVE_NONE
+        assert msg.payload == b""
+
+    async def test_read_suggest_piece(self):
+        data = encode_suggest_piece(5)
+        reader = make_reader(data)
+        msg = await read_message(reader)
+        assert msg.msg_id == MSG_SUGGEST_PIECE
+        (index,) = struct.unpack("!I", msg.payload)
+        assert index == 5
+
+    async def test_read_reject_request(self):
+        data = encode_reject_request(2, 16384, 16384)
+        reader = make_reader(data)
+        msg = await read_message(reader)
+        assert msg.msg_id == MSG_REJECT_REQUEST
+        assert msg.request_fields() == (2, 16384, 16384)
+
+    async def test_read_allowed_fast(self):
+        data = encode_allowed_fast(3)
+        reader = make_reader(data)
+        msg = await read_message(reader)
+        assert msg.msg_id == MSG_ALLOWED_FAST
+        (index,) = struct.unpack("!I", msg.payload)
+        assert index == 3

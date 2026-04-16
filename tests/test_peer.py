@@ -696,3 +696,84 @@ class TestAccept:
         conn     = await PeerConnection.accept(reader, writer, INFO_HASH, PEER_ID)
         assert conn.host == "9.8.7.6"
         assert conn.port == 54321
+
+
+# ---------------------------------------------------------------------------
+# BEP 6 — Fast Extension integration
+# ---------------------------------------------------------------------------
+
+class TestFastExtensionPeer:
+    """Tests for BEP 6 HAVE_ALL/HAVE_NONE handling in PeerConnection."""
+
+    def _make_handshake(self, reserved=None):
+        """Build a 68-byte handshake + optional follow-on messages."""
+        from bittorrent.messages import EXT_AND_FAST_RESERVED, encode_handshake
+        r = reserved if reserved is not None else EXT_AND_FAST_RESERVED
+        return encode_handshake(INFO_HASH, THEIR_ID, reserved=r)
+
+    async def test_have_all_sets_full_bitfield(self):
+        """HAVE_ALL received after handshake builds an all-ones bitfield."""
+        from bittorrent.messages import EXT_AND_FAST_RESERVED, encode_have_all
+        hs   = encode_handshake(INFO_HASH, THEIR_ID, reserved=EXT_AND_FAST_RESERVED)
+        data = hs + encode_have_all()
+        reader = make_reader(data)
+        writer = MockWriter()
+        conn = PeerConnection._from_streams("1.2.3.4", 6881, reader, writer)
+        conn.num_pieces = 8
+        await conn._handshake(INFO_HASH, PEER_ID, extension_protocol=True)
+        # All 8 bits should be set in a 1-byte bitfield
+        assert conn.bitfield == bytearray(b"\xff")
+        assert conn.remote_supports_fast is True
+
+    async def test_have_none_sets_empty_bitfield(self):
+        """HAVE_NONE received after handshake gives empty bitfield."""
+        from bittorrent.messages import EXT_AND_FAST_RESERVED, encode_have_none
+        hs   = encode_handshake(INFO_HASH, THEIR_ID, reserved=EXT_AND_FAST_RESERVED)
+        data = hs + encode_have_none()
+        reader = make_reader(data)
+        writer = MockWriter()
+        conn = PeerConnection._from_streams("1.2.3.4", 6881, reader, writer)
+        conn.num_pieces = 4
+        await conn._handshake(INFO_HASH, PEER_ID, extension_protocol=True)
+        assert conn.bitfield == bytearray()
+
+    async def test_non_fast_peer_sets_flag_false(self):
+        """Peer that sends plain handshake (no Fast Extension bit) sets remote_supports_fast=False."""
+        from bittorrent.messages import encode_handshake
+        hs = encode_handshake(INFO_HASH, THEIR_ID)  # no reserved bits
+        reader = make_reader(hs)
+        writer = MockWriter()
+        conn = PeerConnection._from_streams("1.2.3.4", 6881, reader, writer)
+        await conn._handshake(INFO_HASH, PEER_ID)
+        assert conn.remote_supports_fast is False
+
+    async def test_reject_request_raises_peer_error(self):
+        """REJECT_REQUEST received during download raises PeerError."""
+        from bittorrent.messages import encode_reject_request
+        import hashlib
+        piece_data = b"\xab" * BLOCK_SIZE
+        piece_hash = hashlib.sha1(piece_data).digest()
+
+        # Use _from_streams so no handshake is exchanged; only put the reject
+        # in the reader (no handshake prefix — _from_streams skips the handshake).
+        reject = encode_reject_request(0, 0, BLOCK_SIZE)
+        reader = make_reader(reject)
+        writer = MockWriter()
+        conn   = PeerConnection._from_streams("1.2.3.4", 6881, reader, writer)
+        conn.am_choked = False  # already unchoked to skip wait
+
+        with pytest.raises(PeerError, match="rejected"):
+            await conn.download_piece(0, BLOCK_SIZE, piece_hash)
+
+    async def test_handshake_advertises_fast_ext_reserved(self):
+        """When extension_protocol=True, our handshake sets the Fast Extension bit."""
+        from bittorrent.messages import decode_handshake_full, supports_fast_extension
+        hs = encode_handshake(INFO_HASH, THEIR_ID)
+        reader = make_reader(hs)
+        writer = MockWriter()
+        conn = PeerConnection._from_streams("1.2.3.4", 6881, reader, writer)
+        await conn._handshake(INFO_HASH, PEER_ID, extension_protocol=True)
+        # Check that the bytes we wrote advertised BEP 6
+        sent = bytes(writer.buffer)
+        _, _, our_reserved = decode_handshake_full(sent[:68])
+        assert supports_fast_extension(our_reserved)

@@ -23,15 +23,19 @@ from typing import TYPE_CHECKING
 
 from bittorrent.messages import (
     BLOCK_SIZE,
+    EXT_AND_FAST_RESERVED,
     EXT_PROTOCOL_RESERVED,
     HANDSHAKE_LEN,
     MSG_BITFIELD,
     MSG_CHOKE,
     MSG_EXTENDED,
     MSG_HAVE,
+    MSG_HAVE_ALL,
+    MSG_HAVE_NONE,
     MSG_INTERESTED,
     MSG_NOT_INTERESTED,
     MSG_PIECE,
+    MSG_REJECT_REQUEST,
     MSG_REQUEST,
     MSG_UNCHOKE,
     PeerMessage,
@@ -42,12 +46,16 @@ from bittorrent.messages import (
     encode_extended,
     encode_handshake,
     encode_have,
+    encode_have_all,
+    encode_have_none,
     encode_interested,
     encode_piece,
+    encode_reject_request,
     encode_request,
     encode_unchoke,
     read_message,
     supports_extension_protocol,
+    supports_fast_extension,
 )
 
 log = logging.getLogger(__name__)
@@ -80,6 +88,10 @@ class PeerConnection:
         self.remote_supports_extensions: bool = False
         self._peer_ext_ids: dict[bytes, int] = {}  # extension name -> peer's msg id
         self.metadata_size: int = 0                # peer-reported info dict size
+
+        # BEP 6 Fast Extension state
+        self.remote_supports_fast: bool = False
+        self.num_pieces: int = 0   # set from piece_manager; used for HAVE_ALL bitfield
 
     # ------------------------------------------------------------------
     # Construction helpers
@@ -209,10 +221,11 @@ class PeerConnection:
         conn._writer = writer
         conn.remote_peer_id = their_id
         conn.remote_supports_extensions = supports_extension_protocol(their_reserved)
+        conn.remote_supports_fast = supports_fast_extension(their_reserved)
 
         if extension_protocol:
             await conn._send_raw(
-                encode_handshake(info_hash, peer_id, reserved=EXT_PROTOCOL_RESERVED)
+                encode_handshake(info_hash, peer_id, reserved=EXT_AND_FAST_RESERVED)
             )
         else:
             await conn._send_raw(encode_handshake(info_hash, peer_id))
@@ -230,6 +243,20 @@ class PeerConnection:
     async def send_bitfield(self, bitfield: bytes | bytearray) -> None:
         """Send our BITFIELD to the peer."""
         await self._send_raw(encode_bitfield(bitfield))
+
+    async def send_have_all(self) -> None:
+        """BEP 6: send HAVE_ALL (we are a seeder with all pieces)."""
+        await self._send_raw(encode_have_all())
+
+    async def send_have_none(self) -> None:
+        """BEP 6: send HAVE_NONE (we have no pieces yet)."""
+        await self._send_raw(encode_have_none())
+
+    async def send_reject_request(
+        self, piece_index: int, block_offset: int, block_length: int
+    ) -> None:
+        """BEP 6: send REJECT_REQUEST to explicitly decline a block request."""
+        await self._send_raw(encode_reject_request(piece_index, block_offset, block_length))
 
     async def send_choke(self) -> None:
         """Choke the remote peer (stop serving their requests)."""
@@ -286,8 +313,9 @@ class PeerConnection:
     ) -> None:
         """Send our handshake and validate the peer's response."""
         if extension_protocol:
+            # Always advertise both BEP 10 and BEP 6 together
             await self._send_raw(
-                encode_handshake(info_hash, peer_id, reserved=EXT_PROTOCOL_RESERVED)
+                encode_handshake(info_hash, peer_id, reserved=EXT_AND_FAST_RESERVED)
             )
         else:
             await self._send_raw(encode_handshake(info_hash, peer_id))
@@ -317,9 +345,10 @@ class PeerConnection:
 
         self.remote_peer_id = their_id
         self.remote_supports_extensions = supports_extension_protocol(their_reserved)
-        log.debug("Handshake OK with %s:%s peer_id=%s ext=%s",
+        self.remote_supports_fast = supports_fast_extension(their_reserved)
+        log.debug("Handshake OK with %s:%s peer_id=%s ext=%s fast=%s",
                   self.host, self.port, their_id.hex(),
-                  self.remote_supports_extensions)
+                  self.remote_supports_extensions, self.remote_supports_fast)
 
         # Peers often send a BITFIELD immediately after their handshake.
         # Read it if present (it's optional per BEP 3).
@@ -332,10 +361,11 @@ class PeerConnection:
             await self._send_raw(encode_interested())
 
     async def _maybe_read_bitfield(self) -> None:
-        """If the next message is a BITFIELD, read and store it.
+        """If the next message is a BITFIELD/HAVE_ALL/HAVE_NONE, read and store it.
 
         Non-BITFIELD messages are placed in self._pending so _read_next()
         can return them later — we never push data back onto the stream reader.
+        BEP 6: HAVE_ALL and HAVE_NONE replace BITFIELD for Fast Extension peers.
         """
         try:
             msg = await asyncio.wait_for(read_message(self._reader), timeout=3.0)
@@ -346,6 +376,16 @@ class PeerConnection:
             self.bitfield = bytearray(msg.payload)
             log.debug("Got BITFIELD from %s:%s (%d bytes)", self.host, self.port,
                       len(msg.payload))
+        elif msg.msg_id == MSG_HAVE_ALL:
+            # BEP 6: peer has all pieces — synthesize a full bitfield
+            if self.num_pieces > 0:
+                n_bytes = (self.num_pieces + 7) // 8
+                self.bitfield = bytearray(b"\xff" * n_bytes)
+            log.debug("Got HAVE_ALL from %s:%s", self.host, self.port)
+        elif msg.msg_id == MSG_HAVE_NONE:
+            # BEP 6: peer has no pieces
+            self.bitfield = bytearray()
+            log.debug("Got HAVE_NONE from %s:%s", self.host, self.port)
         elif msg.msg_id == MSG_UNCHOKE:
             # Seeder may pre-emptively unchoke us right after handshake.
             self.am_choked = False
@@ -428,10 +468,15 @@ class PeerConnection:
             elif msg.msg_id == MSG_CHOKE:
                 self.am_choked = True
                 raise PeerError(f"Peer choked us while downloading piece {piece_index}")
+            elif msg.msg_id == MSG_REJECT_REQUEST:
+                # BEP 6: peer explicitly declined our request — treat as choke
+                raise PeerError(
+                    f"Peer rejected our request for piece {piece_index}"
+                )
             elif msg.msg_id == MSG_EXTENDED:
                 # Buffer extended messages (e.g. PEX) for processing between pieces
                 self._pending.append(msg)
-            # Ignore HAVE, UNCHOKE, BITFIELD during download
+            # Ignore HAVE, UNCHOKE, BITFIELD, ALLOWED_FAST during download
 
         # Assemble in order
         piece_data = b"".join(received[offset] for offset, _ in blocks)

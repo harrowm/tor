@@ -237,13 +237,24 @@ class _UploadPeer:
     ) -> None:
         """Full lifecycle for one upload peer connection."""
         self._conn = await PeerConnection.accept(
-            reader, writer, info_hash, peer_id
+            reader, writer, info_hash, peer_id,
+            extension_protocol=True,
         )
         conn = self._conn
 
-        # Send our bitfield so the peer knows what we have.
+        # BEP 6: use HAVE_ALL/HAVE_NONE when both sides support Fast Extension.
+        # Fall back to regular BITFIELD otherwise.
         bitfield = self._pm.bitfield_bytes()
-        if any(b != 0 for b in bitfield):
+        num_complete = sum(bin(b).count("1") for b in bitfield)
+        num_pieces = self._pm._num_pieces  # total piece count
+        if conn.remote_supports_fast:
+            if num_complete == num_pieces:
+                await conn.send_have_all()
+            elif num_complete == 0:
+                await conn.send_have_none()
+            else:
+                await conn.send_bitfield(bitfield)
+        elif any(b != 0 for b in bitfield):
             await conn.send_bitfield(bitfield)
 
         # Unchoke immediately if we have a slot.
@@ -275,9 +286,17 @@ class _UploadPeer:
             piece_index, block_offset, block_length = await conn.read_request()
 
             if conn.am_choking:
-                # We choked this peer; ignore their request
+                # BEP 6: send REJECT_REQUEST if Fast Extension is active so the
+                # peer knows immediately, rather than waiting for a timeout.
+                if conn.remote_supports_fast:
+                    try:
+                        await conn.send_reject_request(
+                            piece_index, block_offset, block_length
+                        )
+                    except (PeerError, OSError):
+                        return
                 log.debug(
-                    "Ignoring request from choked peer %s:%s",
+                    "Rejected request from choked peer %s:%s",
                     conn.host, conn.port,
                 )
                 continue

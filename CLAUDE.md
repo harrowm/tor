@@ -109,21 +109,27 @@ tests/
 - [x] Tracker completed/stopped events — _announce_event() called after download/shutdown
 - [x] End-game CANCEL messages — CANCEL sent to losing peers in end-game mode
 - [x] Signal handling — SIGINT/SIGTERM → clean shutdown + stopped announce
+- [x] Fast Extension (BEP 6) — HAVE_ALL/HAVE_NONE/REJECT_REQUEST/ALLOWED_FAST/SUGGEST_PIECE
+- [x] Local Service Discovery (BEP 14) — LAN peer discovery via UDP multicast
+- [x] DHT IPv6 (BEP 32) — nodes6/values6 compact formats, decode_compact_nodes6/peers6
 
-**~700 tests passing.**
+**~750 tests passing.**
 
 ## Key BEP References
 
 - **BEP 3** — Core protocol (peer wire, piece hashing)
 - **BEP 5** — DHT (Kademlia peer discovery)
+- **BEP 6** — Fast Extension (HAVE_ALL, HAVE_NONE, REJECT_REQUEST, ALLOWED_FAST)
 - **BEP 9** — Metadata exchange (magnet links)
 - **BEP 10** — Extension protocol
 - **BEP 11** — Peer Exchange (PEX)
 - **BEP 12** — Multitracker (announce-list)
+- **BEP 14** — Local Service Discovery (LSD)
 - **BEP 15** — UDP tracker protocol
 - **BEP 19** — Web seeds (HTTP seeding)
 - **BEP 23** — Compact tracker response format
 - **BEP 29** — uTP (Micro Transport Protocol)
+- **BEP 32** — DHT IPv6 extension
 
 ## Critical Technical Notes
 

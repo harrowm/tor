@@ -33,6 +33,7 @@ from rich.table import Column
 from rich.text import Text
 
 from bittorrent.dht import DHTClient
+from bittorrent.lsd import LSDService
 from bittorrent.magnet import MagnetError, parse_magnet, resolve_magnet
 from bittorrent.peer_manager import PeerManager
 from bittorrent.piece_manager import PieceManager
@@ -394,6 +395,27 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         on_piece_complete=(seeder.broadcast_have if seeder else None),
     )
 
+    # BEP 14 — Local Service Discovery: find peers on the same LAN
+    lsd_discovered: list[tuple[str, int]] = []
+
+    def _lsd_on_peer(host: str, port: int) -> None:
+        lsd_discovered.append((host, port))
+        log.info("LSD: found peer %s:%s", host, port)
+
+    lsd: LSDService | None = None
+    lsd_task: asyncio.Task | None = None
+    try:
+        lsd = LSDService(
+            torrent.info_hash, args.port,
+            on_peer=_lsd_on_peer,
+            announce_interval=ANNOUNCE_INTERVAL if hasattr(__builtins__, 'ANNOUNCE_INTERVAL') else 300,
+        )
+        await lsd.start()
+        lsd_task = asyncio.create_task(asyncio.sleep(0))  # placeholder
+    except OSError as exc:
+        log.debug("LSD: failed to start (non-fatal): %s", exc)
+        lsd = None
+
     console.print()
     try:
         with Live(_render(), console=console, refresh_per_second=4,
@@ -405,7 +427,8 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
 
             tick_task = asyncio.create_task(_tick())
             try:
-                await manager.run(peers, on_progress=on_progress, allocate=False)
+                all_peers = list(peers) + lsd_discovered
+                await manager.run(all_peers, on_progress=on_progress, allocate=False)
             finally:
                 tick_task.cancel()
                 try:
@@ -416,7 +439,9 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
                 progress.update(task_id, completed=torrent.total_length)
                 live.update(_render())
     except RuntimeError as exc:
-        # Stop the seeder before returning the error.
+        # Stop LSD, seeder before returning the error.
+        if lsd is not None:
+            await lsd.stop()
         if seeder_task is not None:
             seeder_task.cancel()
             try:
@@ -427,6 +452,10 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
             await seeder.stop()
         console.print(f"\n[red]Download failed:[/red] {exc}")
         return 1
+
+    # Download complete — stop LSD (no longer needed).
+    if lsd is not None:
+        await lsd.stop()
 
     console.print(f"\n[bold green]Done![/bold green] Saved to: {output_dir / torrent.name}")
 
