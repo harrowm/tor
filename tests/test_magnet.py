@@ -27,6 +27,7 @@ from bittorrent.magnet import (
     resolve_magnet,
 )
 from bittorrent.messages import (
+    EXT_AND_FAST_RESERVED,
     EXT_PROTOCOL_RESERVED,
     MSG_EXTENDED,
     decode_handshake_full,
@@ -296,9 +297,9 @@ class TestExtensionHandshake:
             )
 
         assert conn.remote_supports_extensions is True
-        # Verify our sent handshake has the extension bit set
+        # Verify our sent handshake has both extension and fast extension bits set
         our_hs = b"".join(sent)
-        assert our_hs[20:28] == EXT_PROTOCOL_RESERVED
+        assert our_hs[20:28] == EXT_AND_FAST_RESERVED
 
     async def test_open_without_extension_protocol_no_ext_bit(self):
         """open() without extension_protocol sends plain reserved bytes."""

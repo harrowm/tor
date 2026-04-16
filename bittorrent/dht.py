@@ -458,6 +458,10 @@ class DHTClient:
         tasks = [self._bootstrap_node(host, port) for host, port in nodes]
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        if self._table.size() == 0:
+            log.warning("DHT bootstrap: no nodes responded — DHT lookup will fail")
+            return 0
+
         # Self-lookup to fill nearby buckets
         await self._find_node_iterative(self._node_id)
         return self._table.size()

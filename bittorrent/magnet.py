@@ -37,6 +37,17 @@ class MagnetError(Exception):
     """Raised when a magnet URI is invalid or cannot be resolved."""
 
 
+# Well-known public trackers used as fallback when a magnet link has none.
+# Many clients (qBittorrent, Deluge, etc.) ship a similar built-in list.
+FALLBACK_TRACKERS: list[str] = [
+    "udp://tracker.opentrackr.org:1337/announce",
+    "udp://open.tracker.cl:1337/announce",
+    "udp://tracker.openbittorrent.com:6969/announce",
+    "udp://opentracker.io:6969/announce",
+    "udp://tracker.torrent.eu.org:451/announce",
+]
+
+
 @dataclass
 class MagnetLink:
     """Parsed magnet URI."""
@@ -138,7 +149,12 @@ async def resolve_magnet(
     """
     peers: list[tuple[str, int]] = []
 
-    for tracker_url in magnet.trackers:
+    # Use fallback public trackers when the magnet link carries none.
+    tracker_urls = magnet.trackers or FALLBACK_TRACKERS
+    if not magnet.trackers:
+        log.info("Magnet has no trackers — using built-in public tracker list")
+
+    for tracker_url in tracker_urls:
         try:
             resp = await tracker_announce(
                 tracker_url, magnet.info_hash, peer_id, port,
