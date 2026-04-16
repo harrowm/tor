@@ -339,10 +339,12 @@ class DHTTransport(asyncio.DatagramProtocol):
         log.debug("DHT UDP error: %s", exc)
 
     def connection_lost(self, exc: Exception | None) -> None:
-        # Fail all pending futures
+        # Fail all pending futures and immediately consume the exception to
+        # prevent asyncio from logging "Future exception was never retrieved".
         for fut in self._pending.values():
             if not fut.done():
                 fut.set_exception(ConnectionError("DHT transport closed"))
+                fut.exception()  # mark as retrieved
         self._pending.clear()
 
     # ------------------------------------------------------------------
@@ -461,17 +463,30 @@ class DHTClient:
         return self._table.size()
 
     async def _bootstrap_node(self, host: str, port: int) -> None:
+        # Resolve hostname asynchronously — passing a hostname directly to
+        # sendto() triggers a blocking getaddrinfo() call that stalls the loop.
+        try:
+            loop = asyncio.get_event_loop()
+            infos = await asyncio.wait_for(
+                loop.getaddrinfo(host, port, type=socket.SOCK_DGRAM),
+                timeout=5.0,
+            )
+            ip = infos[0][4][0]
+        except Exception as exc:
+            log.debug("Bootstrap DNS %s failed: %s", host, exc)
+            return
+
         txid = self._next_txid()
         data = encode_ping(txid, self._node_id)
         try:
-            resp, _ = await self._transport.request(data, (host, port), txid)
+            resp, _ = await self._transport.request(data, (ip, port), txid)
             r = resp.get(b"r", {})
             node_id = r.get(b"id", b"")
             if len(node_id) == 20:
-                self._table.add(DHTNode(id=node_id, host=host, port=port))
-                log.debug("Bootstrap node %s:%d added (id=%s)", host, port, node_id.hex()[:8])
+                self._table.add(DHTNode(id=node_id, host=ip, port=port))
+                log.debug("Bootstrap node %s (%s):%d added (id=%s)", host, ip, port, node_id.hex()[:8])
         except (asyncio.TimeoutError, OSError) as exc:
-            log.debug("Bootstrap %s:%d failed: %s", host, port, exc)
+            log.debug("Bootstrap %s (%s):%d failed: %s", host, ip, port, exc)
 
     # ------------------------------------------------------------------
     # find_node (iterative — fills routing table)
