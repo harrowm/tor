@@ -113,8 +113,10 @@ LAUNCH
 chmod +x "$APP_PATH/Contents/Resources/launch.sh"
 
 # --- Swift source ---
+# Calls LSSetDefaultHandlerForURLScheme on first launch to claim the magnet: scheme,
+# even if another app currently owns it.
 SWIFT_SRC="$(mktemp /tmp/torrentclient_XXXXXX.swift)"
-cat > "$SWIFT_SRC" <<'SWIFT'
+cat > "$SWIFT_SRC" <<SWIFT
 import Cocoa
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -131,13 +133,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 try task.run()
                 task.waitUntilExit()
             } catch {
-                NSLog("TorrentClient: failed to launch: \(error)")
+                NSLog("TorrentClient: failed to launch: \\(error)")
             }
         }
         NSApp.terminate(nil)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        // Claim the magnet: scheme as our default — overrides any existing handler.
+        let bundleID = Bundle.main.bundleIdentifier! as CFString
+        LSSetDefaultHandlerForURLScheme("magnet" as CFString, bundleID)
+
         // Quit after a short delay if no URL was delivered (e.g. accidental double-click).
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             NSApp.terminate(nil)
@@ -157,25 +163,26 @@ swiftc "$SWIFT_SRC" -o "$APP_PATH/Contents/MacOS/$APP_NAME"
 rm -f "$SWIFT_SRC"
 
 # ---------------------------------------------------------------------------
-# Register with Launch Services
+# Register with Launch Services and claim the scheme
 # ---------------------------------------------------------------------------
 
 echo "Registering with Launch Services ..."
 "$LSREGISTER" -f "$APP_PATH"
 
+# Launch the app once so it can call LSSetDefaultHandlerForURLScheme on itself.
+# It will quit automatically after ~1 second.
+echo "Claiming magnet: scheme ..."
+open -a "$APP_PATH"
+sleep 2
+
 # ---------------------------------------------------------------------------
-# Set as default handler
+# Done
 # ---------------------------------------------------------------------------
 
-# Use the open command to trigger the "which app should handle this?" prompt
-# if another handler is already set, or silently succeed if none is.
 echo ""
-echo "Done! $APP_PATH installed."
+echo "Done! $APP_PATH installed and set as the default magnet: handler."
 echo ""
-echo "Next: open a magnet link in your browser. macOS will ask which app to use"
-echo "— choose '$APP_NAME' and tick 'Always Open With'."
-echo ""
-echo "Or run this to test it right now (swap in a real info_hash):"
+echo "Test it:"
 echo "  open 'magnet:?xt=urn:btih:0000000000000000000000000000000000000000'"
 echo ""
 echo "Logs are written to: ~/Library/Logs/TorrentClient.log"

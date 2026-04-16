@@ -60,9 +60,9 @@ This builds a minimal app bundle at `/Applications/TorrentClient.app`, registers
 with macOS Launch Services as the `magnet:` URL handler, and embeds a launcher that
 points back to this repo. Requires Xcode Command Line Tools (`xcode-select --install`).
 
-The first time you click a magnet link, macOS will ask which app to use — choose
-**TorrentClient** and tick **Always Open With**. Downloads go to `~/Downloads`.
-Logs are written to `~/Library/Logs/TorrentClient.log`.
+The script claims the `magnet:` scheme immediately, even if another app currently
+owns it. Downloads go to `~/Downloads`. Logs are written to
+`~/Library/Logs/TorrentClient.log`.
 
 To uninstall:
 ```bash
