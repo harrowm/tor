@@ -108,7 +108,14 @@ LOG="\$HOME/Library/Logs/TorrentClient.log"
 mkdir -p "\$(dirname "\$LOG")"
 echo "\$(date): opening \$MAGNET" >> "\$LOG"
 cd "$REPO_DIR"
-exec "$UV_PATH" run bittorrent "\$MAGNET" --output-dir "\$HOME/Downloads" >> "\$LOG" 2>&1
+
+# Open a Terminal window that runs the client with its Rich progress UI.
+osascript <<APPLESCRIPT
+tell application "Terminal"
+    activate
+    do script "cd '$REPO_DIR' && '$UV_PATH' run bittorrent '$MAGNET' --output-dir \"\$HOME/Downloads\"; echo; echo 'Download complete — press any key to close'; read -n1"
+end tell
+APPLESCRIPT
 LAUNCH
 chmod +x "$APP_PATH/Contents/Resources/launch.sh"
 
