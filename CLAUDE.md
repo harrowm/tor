@@ -113,7 +113,7 @@ tests/
 - [x] Local Service Discovery (BEP 14) — LAN peer discovery via UDP multicast
 - [x] DHT IPv6 (BEP 32) — nodes6/values6 compact formats, decode_compact_nodes6/peers6
 
-**~750 tests passing.**
+**749 tests passing.**
 
 ## Key BEP References
 

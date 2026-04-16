@@ -50,7 +50,7 @@ uv run bittorrent ubuntu.torrent
 
 ## Running tests
 
-There are a total of 695 tests covering all major features.  The tests take a few minutes to run as they require a few timeouts to trigger.
+There are a total of 749 tests covering all major features.  The tests take a few minutes to run as they require a few timeouts to trigger.
 
 ```bash
 uv sync --group dev
