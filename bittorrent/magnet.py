@@ -22,6 +22,8 @@ import logging
 import urllib.parse
 from dataclasses import dataclass, field
 
+import aiohttp
+
 from bittorrent.dht import DHTClient
 from bittorrent.metadata import fetch_metadata
 from bittorrent.peer import PeerConnection, PeerError
@@ -54,6 +56,7 @@ class MagnetLink:
     info_hash: bytes
     name: str | None = None
     trackers: list[str] = field(default_factory=list)
+    exact_sources: list[str] = field(default_factory=list)  # xs= (.torrent URLs)
 
     @property
     def info_hash_hex(self) -> str:
@@ -92,7 +95,13 @@ def parse_magnet(uri: str) -> MagnetLink:
 
     trackers = [urllib.parse.unquote_plus(t) for t in params.get("tr", [])]
 
-    return MagnetLink(info_hash=info_hash, name=name, trackers=trackers)
+    exact_sources = [
+        urllib.parse.unquote_plus(s) for s in params.get("xs", [])
+        if s.lower().startswith(("http://", "https://"))
+    ]
+
+    return MagnetLink(info_hash=info_hash, name=name, trackers=trackers,
+                      exact_sources=exact_sources)
 
 
 def _decode_btih(s: str) -> bytes:
@@ -147,6 +156,23 @@ async def resolve_magnet(
     Raises:
         MagnetError: No peers found at all, or no peer delivers valid metadata.
     """
+    # xs= exact source: fetch the .torrent file directly from an HTTP URL.
+    # This is the fastest path — no peers or DHT needed.
+    for xs_url in magnet.exact_sources:
+        try:
+            log.info("Trying exact source: %s", xs_url)
+            async with aiohttp.ClientSession() as session:
+                async with session.get(xs_url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                    resp.raise_for_status()
+                    data = await resp.read()
+            torrent = parse_torrent(data)
+            if torrent.info_hash == magnet.info_hash:
+                log.info("Got torrent from exact source: %s", xs_url)
+                return torrent
+            log.warning("xs= torrent info_hash mismatch, skipping %s", xs_url)
+        except Exception as exc:
+            log.warning("xs= fetch failed for %s: %s", xs_url, exc)
+
     peers: list[tuple[str, int]] = []
 
     # Use fallback public trackers when the magnet link carries none.
