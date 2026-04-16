@@ -154,16 +154,22 @@ async def resolve_magnet(
     if not magnet.trackers:
         log.info("Magnet has no trackers — using built-in public tracker list")
 
-    for tracker_url in tracker_urls:
+    async def _try_tracker(url: str) -> list[tuple[str, int]]:
         try:
             resp = await tracker_announce(
-                tracker_url, magnet.info_hash, peer_id, port,
+                url, magnet.info_hash, peer_id, port,
                 left=0, event="started",
             )
-            peers.extend(resp.peers)
-            log.info("Tracker %s: %d peers", tracker_url, len(resp.peers))
+            log.info("Tracker %s: %d peers", url, len(resp.peers))
+            return resp.peers
         except TrackerError as exc:
-            log.warning("Tracker %s failed: %s", tracker_url, exc)
+            log.warning("Tracker %s failed: %s", url, exc)
+            return []
+
+    # Announce to all trackers concurrently — avoids stacking timeouts.
+    results = await asyncio.gather(*[_try_tracker(u) for u in tracker_urls])
+    for result in results:
+        peers.extend(result)
 
     # Fall back to DHT when trackers yield no peers (or there are no trackers)
     if not peers:
