@@ -113,7 +113,7 @@ cd "$REPO_DIR"
 osascript <<APPLESCRIPT
 tell application "Terminal"
     activate
-    do script "cd '$REPO_DIR' && '$UV_PATH' run bittorrent '\$MAGNET' --output-dir \"\$HOME/Downloads\"; echo; echo 'Download complete — press Enter to close'; read"
+    do script "cd '$REPO_DIR' && '$UV_PATH' run bittorrent '\$MAGNET' --output-dir \"\$HOME/Downloads\" --verbose; echo; echo 'Download complete — press Enter to close'; read"
 end tell
 APPLESCRIPT
 LAUNCH
