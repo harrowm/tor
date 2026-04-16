@@ -48,6 +48,27 @@ uv sync
 uv run bittorrent ubuntu.torrent
 ```
 
+## macOS magnet link integration
+
+To make magnet links in your browser open this client automatically:
+
+```bash
+bash setup_magnet_handler.sh
+```
+
+This builds a minimal app bundle at `/Applications/TorrentClient.app`, registers it
+with macOS Launch Services as the `magnet:` URL handler, and embeds a launcher that
+points back to this repo. Requires Xcode Command Line Tools (`xcode-select --install`).
+
+The first time you click a magnet link, macOS will ask which app to use — choose
+**TorrentClient** and tick **Always Open With**. Downloads go to `~/Downloads`.
+Logs are written to `~/Library/Logs/TorrentClient.log`.
+
+To uninstall:
+```bash
+bash setup_magnet_handler.sh --uninstall
+```
+
 ## Running tests
 
 There are a total of 749 tests covering all major features.  The tests take a few minutes to run as they require a few timeouts to trigger.
