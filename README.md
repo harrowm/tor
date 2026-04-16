@@ -1,6 +1,8 @@
 # tor
 
-A BitTorrent client built from scratch in Python. I used Claude to write this to actually understand how BitTorrent works — the protocol, the peer wire format, async I/O, all of it. No libtorrent, no shortcuts.
+A BitTorrent client written in Python using Claude. My aim was to understand how BitTorrent works — the protocol, the peer wire format, async I/O - but also to adjust the "UI" to my own taste.
+
+The Bittorrent list of BEPs is here: https://www.bittorrent.org/beps/bep_0000.html
 
 ## What it does
 
@@ -43,15 +45,16 @@ uv run bittorrent ubuntu.torrent
 
 ## Running tests
 
+There are a total of 695 tests covering all major features.  The tests take a few minutes to run as they require a few timeouts to trigger.
+
 ```bash
 uv sync --group dev
 uv run pytest
 uv run pytest tests/test_peer.py -v   # run one file
 ```
 
-640 tests. Everything is async, everything has tests.
 
-## How it's structured
+## Main code structure
 
 ```
 bittorrent/
@@ -72,15 +75,13 @@ bittorrent/
 
 ## Some notes
 
-The tricky bits:
-
-**info_hash** — you hash the bencoded bytes of the `info` dict, not the decoded dict. Took me a while to get right.
+**info_hash** — you hash the bencoded bytes of the `info` dict, not the decoded dict.
 
 **Block vs piece** — pieces are what you verify (256 KB–4 MB, SHA-1 hashed). Blocks are what you request from peers (always 16,384 bytes). You request blocks, assemble them into a piece, then verify.
 
 **Piece spanning** — in multi-file torrents, a piece can straddle two files. The storage layer handles this by mapping piece byte ranges across the concatenated virtual file space.
 
-**DHT convergence** — the stopping condition for iterative Kademlia lookups is "stop when the K closest nodes you've discovered are all queried", not "stop when the routing table stops changing". Subtle but important.
+**DHT convergence** — the stopping condition for iterative Kademlia lookups is "stop when the K closest nodes you've discovered are all queried", not "stop when the routing table stops changing".
 
 **INTERESTED timing** — seeders close idle connections 1–2 seconds after the handshake. You need to send INTERESTED immediately, not wait until you're ready to request a piece.
 

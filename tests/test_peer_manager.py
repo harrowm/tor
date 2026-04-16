@@ -74,7 +74,7 @@ class FakePeer:
         self.remote_supports_extensions = False
         self._pending: list = []
 
-    async def download_piece(self, piece_index, piece_size, expected_hash):
+    async def download_piece(self, piece_index, piece_size, expected_hash, **kwargs):
         return self._pieces[piece_index]
 
     async def do_extension_handshake(self, extensions, *, timeout=15.0):
@@ -273,7 +273,7 @@ class TestConnectionFailure:
             port     = 6881
             bitfield = bytearray(b"\xc0")
 
-            async def download_piece(self, idx, size, h):
+            async def download_piece(self, idx, size, h, **kwargs):
                 if idx == 0:
                     raise PeerError("piece 0 failed")
                 return pieces[idx]
@@ -388,7 +388,7 @@ class TestParallelDownload:
         download_counts: dict[int, int] = {i: 0 for i in range(4)}
 
         class CountingPeer(FakePeer):
-            async def download_piece(self, idx, size, h):
+            async def download_piece(self, idx, size, h, **kwargs):
                 download_counts[idx] += 1
                 return self._pieces[idx]
 
@@ -438,7 +438,7 @@ class TestParallelDownload:
             port     = 2
             bitfield = bytearray(b"\x40")  # piece 1
 
-            async def download_piece(self, idx, size, h):
+            async def download_piece(self, idx, size, h, **kwargs):
                 await asyncio.sleep(0)   # yield so other tasks run first
                 raise PeerError("peer B failed")
 
@@ -482,7 +482,7 @@ class TestDisconnectionHandling:
             port     = 6881
             bitfield = bytearray(b"\xc0")  # pieces 0,1
 
-            async def download_piece(self, idx, size, h):
+            async def download_piece(self, idx, size, h, **kwargs):
                 raise PeerError("simulated block timeout")
 
             async def close(self): pass
@@ -518,7 +518,7 @@ class TestDisconnectionHandling:
             port     = 6881
             bitfield = bytearray(b"\x80")
 
-            async def download_piece(self, idx, size, h):
+            async def download_piece(self, idx, size, h, **kwargs):
                 raise PeerError("timeout")
 
             async def close(self): pass
@@ -548,7 +548,7 @@ class TestDisconnectionHandling:
             port     = 6881
             bitfield = bytearray(b"\xe0")  # pieces 0,1,2
 
-            async def download_piece(self, idx, size, h):
+            async def download_piece(self, idx, size, h, **kwargs):
                 if idx == 0:
                     return pieces[0]
                 raise PeerError("timeout on piece %d" % idx)
@@ -586,7 +586,7 @@ class TestDisconnectionHandling:
             port     = 6881
             bitfield = bytearray(b"\xc0")
 
-            async def download_piece(self, idx, size, h):
+            async def download_piece(self, idx, size, h, **kwargs):
                 raise PeerError("connection reset by peer")
 
             async def close(self): pass
@@ -845,8 +845,8 @@ class TestPEX:
                 self._pending = []
                 self._pex_injected = False
 
-            async def download_piece(self, idx, size, h):
-                data = await super().download_piece(idx, size, h)
+            async def download_piece(self, idx, size, h, **kwargs):
+                data = await super().download_piece(idx, size, h, **kwargs)
                 if not self._pex_injected:
                     self._pending.append(pex_msg)
                     self._pex_injected = True
@@ -1056,3 +1056,75 @@ class TestUTPFallback:
         assert pm.is_complete()
         for i, expected in enumerate(pieces):
             assert storage.read_piece(i) == expected
+
+
+# ---------------------------------------------------------------------------
+# on_piece_complete callback
+# ---------------------------------------------------------------------------
+
+class TestOnPieceComplete:
+    async def test_callback_called_for_each_new_piece(self, tmp_path):
+        """on_piece_complete is invoked with the piece index after each new piece."""
+        pieces = make_pieces(3)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+
+        completed_indices = []
+
+        def record(idx):
+            completed_indices.append(idx)
+
+        manager = PeerManager(
+            torrent, pm, storage, INFO_HASH, PEER_ID,
+            on_piece_complete=record,
+        )
+
+        peer = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\xe0")
+        with patch("bittorrent.peer_manager.PeerConnection.open",
+                   new=AsyncMock(return_value=peer)):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert len(completed_indices) == 3
+        assert sorted(completed_indices) == [0, 1, 2]
+
+    async def test_callback_not_called_for_already_complete_pieces(self, tmp_path):
+        """on_piece_complete fires only for newly completed pieces, not duplicates."""
+        pieces = make_pieces(2)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+
+        # Pre-complete piece 0
+        storage.allocate()
+        storage.write_piece(0, pieces[0])
+        pm.mark_complete(0)
+
+        calls = []
+        manager = PeerManager(
+            torrent, pm, storage, INFO_HASH, PEER_ID,
+            on_piece_complete=lambda idx: calls.append(idx),
+        )
+
+        peer = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\xc0")
+        with patch("bittorrent.peer_manager.PeerConnection.open",
+                   new=AsyncMock(return_value=peer)):
+            await manager.run([("1.2.3.4", 6881)])
+
+        # Only piece 1 should trigger the callback
+        assert calls == [1]
+
+    async def test_no_callback_is_fine(self, tmp_path):
+        """PeerManager works normally when on_piece_complete is None."""
+        pieces = make_pieces(1)
+        torrent = make_torrent(pieces)
+        pm      = make_pm(torrent)
+        storage = make_storage(torrent, tmp_path)
+        manager = PeerManager(torrent, pm, storage, INFO_HASH, PEER_ID)
+
+        peer = FakePeer("1.2.3.4", 6881, pieces, bitfield=b"\x80")
+        with patch("bittorrent.peer_manager.PeerConnection.open",
+                   new=AsyncMock(return_value=peer)):
+            await manager.run([("1.2.3.4", 6881)])
+
+        assert pm.is_complete()

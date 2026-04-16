@@ -37,6 +37,7 @@ from bittorrent.messages import (
     PeerMessage,
     decode_handshake_full,
     encode_bitfield,
+    encode_cancel,
     encode_choke,
     encode_extended,
     encode_handshake,
@@ -363,6 +364,7 @@ class PeerConnection:
         expected_hash: bytes,
         *,
         block_timeout: float = BLOCK_TIMEOUT,
+        completion_check: "callable[[int], bool] | None" = None,
     ) -> bytes:
         """Download one piece from this peer and verify its SHA-1 hash.
 
@@ -370,10 +372,16 @@ class PeerConnection:
         collects PIECE messages, assembles and hash-verifies the result.
 
         Args:
-            block_timeout: Seconds to wait for each individual block response.
-                           Raises PeerError if a peer stalls mid-piece.
+            block_timeout:    Seconds to wait for each individual block response.
+                              Raises PeerError if a peer stalls mid-piece.
+            completion_check: Optional callable(piece_index) -> bool.  Called
+                              after each block arrives; if it returns True the
+                              piece was completed by another peer (end-game race).
+                              CANCEL is sent for remaining blocks and PeerError
+                              is raised with the message "piece already complete".
 
-        Raises PeerError on choke, hash mismatch, timeout, or unexpected EOF.
+        Raises PeerError on choke, hash mismatch, timeout, unexpected EOF, or
+        when another peer wins the end-game race (completion_check returns True).
         """
         # Send INTERESTED and wait for UNCHOKE only when still choked.
         # The handshake path sends INTERESTED early; by the time
@@ -392,6 +400,20 @@ class PeerConnection:
         # Collect PIECE responses
         received: dict[int, bytes] = {}   # block_offset -> data
         while len(received) < len(blocks):
+            # End-game: another worker finished this piece — cancel our requests.
+            if completion_check and completion_check(piece_index):
+                for offset, length in blocks:
+                    if offset not in received:
+                        try:
+                            await self._send_raw(
+                                encode_cancel(piece_index, offset, length)
+                            )
+                        except (PeerError, OSError):
+                            pass
+                raise PeerError(
+                    f"piece {piece_index} already complete (end-game cancel)"
+                )
+
             try:
                 msg = await asyncio.wait_for(self._read_next(), timeout=block_timeout)
             except asyncio.TimeoutError:

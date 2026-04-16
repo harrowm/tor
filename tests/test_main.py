@@ -8,6 +8,7 @@ instead we verify:
   - The happy path is wired up correctly (mocked tracker + peer manager)
 """
 
+import asyncio
 import hashlib
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -136,6 +137,67 @@ class TestRunSuccess:
 
         instance.run.assert_called_once()
         assert code == 0
+
+    async def test_completed_event_announced_after_download(self, tmp_path):
+        """Tracker 'completed' event is sent after successful download."""
+        torrent_path = make_torrent_file(tmp_path)
+        args = _parse_args([str(torrent_path), "-o", str(tmp_path)])
+        args.leech = True
+
+        response = TrackerResponse(interval=1800, peers=[("1.2.3.4", 6881)], complete=1)
+        events_sent = []
+
+        async def mock_announce(url, info_hash, peer_id, port, **kw):
+            events_sent.append(kw.get("event", ""))
+            return response
+
+        with (
+            patch("bittorrent.main.announce", new=mock_announce),
+            patch("bittorrent.main.PeerManager") as MockPM,
+        ):
+            instance = AsyncMock()
+            instance.run = AsyncMock()
+            MockPM.return_value = instance
+            await _run(args)
+
+        assert "completed" in events_sent
+
+    async def test_stopped_event_announced_when_seeder_shuts_down(self, tmp_path):
+        """Tracker 'stopped' event is sent when the seeder exits cleanly."""
+        import signal as _signal
+        torrent_path = make_torrent_file(tmp_path)
+        args = _parse_args([str(torrent_path), "-o", str(tmp_path)])
+        # leech=False so the seeder starts
+
+        response = TrackerResponse(interval=1800, peers=[("1.2.3.4", 6881)], complete=1)
+        events_sent = []
+
+        async def mock_announce(url, info_hash, peer_id, port, **kw):
+            events_sent.append(kw.get("event", ""))
+            return response
+
+        # Simulate the seeder immediately receiving SIGINT
+        async def instant_seeder_run():
+            # Immediately return so shutdown event fires
+            raise asyncio.CancelledError()
+
+        with (
+            patch("bittorrent.main.announce", new=mock_announce),
+            patch("bittorrent.main.PeerManager") as MockPM,
+            patch("bittorrent.main.Seeder") as MockSeeder,
+        ):
+            instance = AsyncMock()
+            instance.run = AsyncMock()
+            MockPM.return_value = instance
+
+            seeder_instance = AsyncMock()
+            seeder_instance.run = AsyncMock(side_effect=asyncio.CancelledError())
+            seeder_instance.stop = AsyncMock()
+            MockSeeder.return_value = seeder_instance
+
+            await _run(args)
+
+        assert "stopped" in events_sent
 
     async def test_already_complete_returns_0(self, tmp_path):
         torrent_path = make_torrent_file(tmp_path)
@@ -271,3 +333,93 @@ class TestAnnounceAll:
         console = Console(stderr=True)
         peers = await _announce_all(torrent, b"-BC0001-" + b"X" * 12, 6881, console)
         assert peers == []
+
+
+# ---------------------------------------------------------------------------
+# _announce_event — completed / stopped events
+# ---------------------------------------------------------------------------
+
+class TestAnnounceEvent:
+    def _make_torrent(self):
+        from bittorrent.torrent import Torrent
+        import hashlib
+        return Torrent(
+            announce="http://t1.example.com/announce",
+            announce_list=[["http://t2.example.com/announce"]],
+            info_hash=b"\x00" * 20,
+            info_hash_hex="00" * 20,
+            name="test",
+            piece_length=512,
+            piece_hashes=[hashlib.sha1(b"x").digest()],
+            length=512,
+        )
+
+    async def test_completed_event_sent_to_all_trackers(self):
+        from bittorrent.main import _announce_event
+        from unittest.mock import AsyncMock
+        calls = []
+
+        async def mock_announce(url, *a, **kw):
+            calls.append((url, kw.get("event")))
+            from bittorrent.tracker import TrackerResponse
+            return TrackerResponse(interval=1800, peers=[])
+
+        torrent = self._make_torrent()
+        with patch("bittorrent.main.announce", new=mock_announce):
+            await _announce_event(torrent, b"-BC0001-" + b"X" * 12, 6881, "completed")
+
+        urls = [url for url, _ in calls]
+        events = [ev for _, ev in calls]
+        assert "http://t1.example.com/announce" in urls
+        assert "http://t2.example.com/announce" in urls
+        assert all(ev == "completed" for ev in events)
+
+    async def test_stopped_event_sent(self):
+        from bittorrent.main import _announce_event
+
+        events_seen = []
+
+        async def mock_announce(url, *a, **kw):
+            events_seen.append(kw.get("event"))
+            from bittorrent.tracker import TrackerResponse
+            return TrackerResponse(interval=1800, peers=[])
+
+        torrent = self._make_torrent()
+        with patch("bittorrent.main.announce", new=mock_announce):
+            await _announce_event(torrent, b"-BC0001-" + b"X" * 12, 6881, "stopped")
+
+        assert all(ev == "stopped" for ev in events_seen)
+
+    async def test_tracker_failure_does_not_raise(self):
+        """Tracker errors during completed/stopped are silently swallowed."""
+        from bittorrent.main import _announce_event
+        from bittorrent.tracker import TrackerError
+
+        async def failing_announce(*a, **kw):
+            raise TrackerError("timeout")
+
+        torrent = self._make_torrent()
+        # Should not raise
+        with patch("bittorrent.main.announce", new=failing_announce):
+            await _announce_event(torrent, b"-BC0001-" + b"X" * 12, 6881, "completed")
+
+    async def test_no_trackers_does_nothing(self):
+        """Torrent with no trackers: _announce_event completes without error."""
+        from bittorrent.main import _announce_event
+        from bittorrent.torrent import Torrent
+        import hashlib
+
+        torrent = Torrent(
+            announce="",
+            announce_list=[],
+            info_hash=b"\x00" * 20,
+            info_hash_hex="00" * 20,
+            name="test",
+            piece_length=512,
+            piece_hashes=[hashlib.sha1(b"x").digest()],
+            length=512,
+        )
+        # Should not raise even with no trackers
+        with patch("bittorrent.main.announce", new=AsyncMock()) as mock_ann:
+            await _announce_event(torrent, b"-BC0001-" + b"X" * 12, 6881, "completed")
+        mock_ann.assert_not_called()

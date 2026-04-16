@@ -451,6 +451,103 @@ class TestDownloadPiece:
 
 
 # ---------------------------------------------------------------------------
+# CANCEL in end-game (completion_check)
+# ---------------------------------------------------------------------------
+
+class TestCancelEndGame:
+    async def test_no_cancel_when_no_completion_check(self):
+        """Without completion_check, download proceeds normally."""
+        data, h = make_valid_piece(BLOCK_SIZE)
+        reader = make_reader(encode_unchoke() + encode_piece(0, 0, data))
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        result = await peer.download_piece(0, BLOCK_SIZE, h)
+        assert result == data
+        assert MSG_REQUEST in writer.sent_ids()
+        # No CANCEL
+        from bittorrent.messages import MSG_CANCEL
+        assert MSG_CANCEL not in writer.sent_ids()
+
+    async def test_cancel_sent_when_completion_check_returns_true(self):
+        """When completion_check fires, CANCEL is sent for the pending block."""
+        from bittorrent.messages import MSG_CANCEL, encode_cancel
+        data, h = make_valid_piece(BLOCK_SIZE)
+        # Peer sends unchoke only — no PIECE response (it's slow)
+        reader = asyncio.StreamReader()
+        reader.feed_data(encode_unchoke())
+        # Piece will never arrive, but completion_check fires first
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+
+        # completion_check returns True immediately
+        with pytest.raises(PeerError, match="already complete"):
+            await peer.download_piece(
+                0, BLOCK_SIZE, h,
+                block_timeout=1.0,
+                completion_check=lambda idx: True,
+            )
+
+        # CANCEL must have been sent for the one block
+        assert MSG_CANCEL in writer.sent_ids()
+        cancel_payloads = [
+            p for mid, p in writer.messages_sent() if mid == MSG_CANCEL
+        ]
+        assert len(cancel_payloads) == 1
+        pi, off, length = struct.unpack("!III", cancel_payloads[0])
+        assert pi == 0
+        assert off == 0
+        assert length == BLOCK_SIZE
+
+    async def test_cancel_sent_for_all_unreceived_blocks_multi_block(self):
+        """For a multi-block piece, CANCELs cover only blocks not yet received."""
+        from bittorrent.messages import MSG_CANCEL
+        piece_size = BLOCK_SIZE * 3
+        piece_data = bytes(range(256)) * (piece_size // 256)
+        h = hashlib.sha1(piece_data).digest()
+
+        # First block arrives, then completion_check fires before blocks 1 and 2
+        block0 = encode_piece(0, 0, piece_data[:BLOCK_SIZE])
+        reader = asyncio.StreamReader()
+        reader.feed_data(encode_unchoke() + block0)
+
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+
+        call_count = [0]
+        def check(idx):
+            call_count[0] += 1
+            # False on first call (block 0 arrives), True on second
+            return call_count[0] > 1
+
+        with pytest.raises(PeerError, match="already complete"):
+            await peer.download_piece(
+                0, piece_size, h,
+                block_timeout=1.0,
+                completion_check=check,
+            )
+
+        cancel_msgs = [p for mid, p in writer.messages_sent() if mid == MSG_CANCEL]
+        # Blocks 1 and 2 should be cancelled, block 0 was received
+        assert len(cancel_msgs) == 2
+        cancelled_offsets = sorted(
+            struct.unpack("!III", p)[1] for p in cancel_msgs
+        )
+        assert cancelled_offsets == [BLOCK_SIZE, BLOCK_SIZE * 2]
+
+    async def test_completion_check_not_triggered_on_normal_download(self):
+        """If completion_check always returns False, download completes normally."""
+        data, h = make_valid_piece(BLOCK_SIZE)
+        reader = make_reader(encode_unchoke() + encode_piece(0, 0, data))
+        writer = MockWriter()
+        peer   = make_peer(reader, writer)
+        result = await peer.download_piece(
+            0, BLOCK_SIZE, h,
+            completion_check=lambda idx: False,
+        )
+        assert result == data
+
+
+# ---------------------------------------------------------------------------
 # close
 # ---------------------------------------------------------------------------
 

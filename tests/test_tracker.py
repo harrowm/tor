@@ -430,6 +430,25 @@ class TestAnnounce:
                                 INFO_HASH, PEER_ID, 6881)
         assert isinstance(result, TrackerResponse)
 
+    async def test_https_url_routes_to_http_handler(self, patch_session):
+        """https:// URLs use the HTTP handler (aiohttp supports TLS natively)."""
+        peers = compact_peer("5.6.7.8", 6881)
+        session = patch_session(make_tracker_response(peers=peers))
+        result = await announce("https://tracker.example.com/announce",
+                                INFO_HASH, PEER_ID, 6881)
+        assert isinstance(result, TrackerResponse)
+        assert ("5.6.7.8", 6881) in result.peers
+        # Verify the https URL was passed through unchanged
+        assert session.last_url.startswith("https://")
+
+    async def test_https_passes_event_parameter(self, patch_session):
+        """event= is included in HTTPS announce URLs just like HTTP."""
+        peers = compact_peer("1.2.3.4", 6881)
+        session = patch_session(make_tracker_response(peers=peers))
+        await announce("https://tracker.example.com/announce",
+                       INFO_HASH, PEER_ID, 6881, event="started")
+        assert "event=started" in session.last_url
+
 
 # ---------------------------------------------------------------------------
 # UDP packet encoding / decoding — pure functions

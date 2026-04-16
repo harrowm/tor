@@ -60,13 +60,15 @@ class PeerManager:
         peer_id: bytes,
         *,
         use_utp: bool = False,
+        on_piece_complete: "callable[[int], None] | None" = None,
     ) -> None:
-        self._torrent       = torrent
-        self._pm            = piece_manager
-        self._storage       = storage
-        self._info_hash     = info_hash
-        self._peer_id       = peer_id
-        self._use_utp       = use_utp
+        self._torrent           = torrent
+        self._pm                = piece_manager
+        self._storage           = storage
+        self._info_hash         = info_hash
+        self._peer_id           = peer_id
+        self._use_utp           = use_utp
+        self._on_piece_complete = on_piece_complete
         self._active_tasks: set[asyncio.Task] = set()
         # Pre-seed stats with any pieces already complete (resume case).
         already_done = piece_manager.progress()[0]
@@ -416,8 +418,17 @@ class PeerManager:
             expected_hash = self._torrent.piece_hashes[piece_index]
 
             try:
-                data = await conn.download_piece(piece_index, piece_size, expected_hash)
+                data = await conn.download_piece(
+                    piece_index, piece_size, expected_hash,
+                    completion_check=self._pm.is_complete_piece,
+                )
             except PeerError as exc:
+                if "already complete" in str(exc):
+                    # End-game: another peer won the race; CANCEL was sent.
+                    # Return the piece to MISSING so stats stay consistent,
+                    # then continue looking for another piece to download.
+                    self._pm.mark_missing(piece_index)
+                    continue
                 self._pm.mark_missing(piece_index)
                 raise  # let _download_from_peer log it and close connection
 
@@ -438,6 +449,10 @@ class PeerManager:
                 done, total = self._pm.progress()
                 log.info("Piece %d/%d complete (%.1f%%)", done, total,
                          self._stats.percent)
+
+                # Notify the seeder so it can broadcast HAVE to upload peers.
+                if self._on_piece_complete is not None:
+                    self._on_piece_complete(piece_index)
 
                 if on_progress:
                     await on_progress(self._stats)

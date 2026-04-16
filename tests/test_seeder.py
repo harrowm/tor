@@ -276,11 +276,12 @@ class TestUploadPeerServe:
 # ---------------------------------------------------------------------------
 
 class TestSeederRechoke:
-    def _make_mock_peer(self, am_choking=True, peer_interested=True, closed=False):
+    def _make_mock_peer(self, am_choking=True, peer_interested=True, closed=False, bytes_sent=0):
         peer = MagicMock()
         peer.am_choking = am_choking
         peer.peer_interested = peer_interested
         peer.closed = closed
+        peer.bytes_sent = bytes_sent
         peer.send_unchoke_safe = AsyncMock()
         peer.send_choke_safe = AsyncMock()
         return peer
@@ -388,6 +389,74 @@ class TestSeederBroadcastHave:
 
 # ---------------------------------------------------------------------------
 # CLI --leech flag
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Optimistic unchoke
+# ---------------------------------------------------------------------------
+
+class TestOptimisticUnchoke:
+    def _make_mock_peer(self, am_choking=True, peer_interested=True, closed=False, bytes_sent=0):
+        peer = MagicMock()
+        peer.am_choking = am_choking
+        peer.peer_interested = peer_interested
+        peer.closed = closed
+        peer.bytes_sent = bytes_sent
+        peer.send_unchoke_safe = AsyncMock()
+        peer.send_choke_safe = AsyncMock()
+        return peer
+
+    async def test_unchokes_one_random_choked_peer(self):
+        torrent = make_torrent()
+        pm      = make_pm()
+        storage = make_storage()
+        seeder  = Seeder(torrent, storage, pm, info_hash=INFO_HASH, peer_id=PEER_ID)
+
+        peers = [self._make_mock_peer(am_choking=True) for _ in range(3)]
+        seeder._peers = peers
+
+        seeder._do_optimistic_unchoke()
+
+        unchoked = sum(1 for p in peers if p.send_unchoke_safe.called)
+        assert unchoked == 1
+
+    async def test_does_nothing_when_no_choked_interested_peers(self):
+        torrent = make_torrent()
+        pm      = make_pm()
+        storage = make_storage()
+        seeder  = Seeder(torrent, storage, pm, info_hash=INFO_HASH, peer_id=PEER_ID)
+
+        # All peers already unchoked
+        peers = [self._make_mock_peer(am_choking=False) for _ in range(3)]
+        seeder._peers = peers
+
+        seeder._do_optimistic_unchoke()
+
+        assert all(not p.send_unchoke_safe.called for p in peers)
+
+    async def test_rechoke_prefers_high_bytes_sent(self):
+        """Peers with more bytes_sent keep their slots in regular rechoke."""
+        torrent = make_torrent()
+        pm      = make_pm()
+        storage = make_storage()
+        seeder  = Seeder(torrent, storage, pm, info_hash=INFO_HASH, peer_id=PEER_ID)
+
+        # Create MAX_UPLOAD_SLOTS + 1 unchoked peers, one with 0 bytes_sent
+        fast_peers = [
+            self._make_mock_peer(am_choking=False, bytes_sent=1_000_000)
+            for _ in range(MAX_UPLOAD_SLOTS)
+        ]
+        slow_peer = self._make_mock_peer(am_choking=False, bytes_sent=0)
+        seeder._peers = fast_peers + [slow_peer]
+
+        seeder._rechoke()
+
+        # The slow peer (0 bytes_sent) should be choked
+        assert slow_peer.send_choke_safe.called
+        for p in fast_peers:
+            assert not p.send_choke_safe.called
+
+
 # ---------------------------------------------------------------------------
 
 class TestLeechFlag:

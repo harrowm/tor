@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import signal
 import sys
 import time
 from pathlib import Path
@@ -35,6 +36,7 @@ from bittorrent.dht import DHTClient
 from bittorrent.magnet import MagnetError, parse_magnet, resolve_magnet
 from bittorrent.peer_manager import PeerManager
 from bittorrent.piece_manager import PieceManager
+from bittorrent.seeder import Seeder
 from bittorrent.storage import Storage
 from bittorrent.torrent import ParseError, load
 from bittorrent.tracker import TrackerError, announce, generate_peer_id
@@ -146,6 +148,45 @@ async def _announce_all(
     await asyncio.gather(*[_try(url) for url in trackers])
     console.print(f"Total: [bold]{len(all_peers)}[/bold] unique peers")
     return all_peers
+
+
+async def _announce_event(
+    torrent: "Torrent",
+    peer_id: bytes,
+    port: int,
+    event: str,
+    *,
+    downloaded: int = 0,
+) -> None:
+    """Fire-and-forget announce for 'completed' or 'stopped' events.
+
+    Sends to all trackers concurrently.  Failures are silently ignored —
+    this is best-effort; the torrent still works without it.
+    """
+    log = logging.getLogger(__name__)
+    seen_urls: set[str] = set()
+    trackers: list[str] = []
+    for url in [torrent.announce] + [u for tier in torrent.announce_list for u in tier]:
+        if url and url not in seen_urls:
+            seen_urls.add(url)
+            trackers.append(url)
+
+    async def _try(url: str) -> None:
+        try:
+            await announce(
+                url, torrent.info_hash, peer_id, port,
+                downloaded=downloaded,
+                left=0,
+                event=event,
+                timeout=5,
+            )
+            log.debug("Tracker %s event=%s OK", url, event)
+        except TrackerError as exc:
+            log.debug("Tracker %s event=%s failed: %s", url, event, exc)
+
+    if trackers:
+        await asyncio.gather(*[_try(url) for url in trackers],
+                             return_exceptions=True)
 
 
 async def _dht_peers(
@@ -315,6 +356,21 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         map_text = _piece_map(fracs, _map_width)
         return RGroup(progress, _make_status(), Text(""), map_text)
 
+    # --- Seeder (started early so we can serve pieces during download) ---
+    # The seeder runs the entire time — even before download completes it can
+    # serve pieces we've already verified to other leechers in the swarm.
+    seeder: Seeder | None = None
+    seeder_task: asyncio.Task | None = None
+    if not args.leech:
+        seeder = Seeder(
+            torrent, storage, pm,
+            info_hash=torrent.info_hash,
+            peer_id=peer_id,
+            port=args.port,
+        )
+        seeder_task = asyncio.create_task(seeder.run())
+        log.debug("Seeder started on port %d", args.port)
+
     async def on_progress(stats) -> None:
         bytes_done = stats.pieces_complete * torrent.piece_length
         # Last piece may be shorter — don't overshoot total
@@ -322,6 +378,12 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         _state["peers"]     = stats.peers_active
         _state["bytes_done"] = bytes_done
         progress.update(task_id, completed=bytes_done)
+        # Broadcast newly completed piece to any connected upload peers.
+        if seeder is not None and stats.pieces_complete > 0:
+            # pieces_complete is a running total; the last completed index isn't
+            # directly available here — PeerManager updates stats after mark_complete.
+            # We broadcast the most recently completed piece index via the manager.
+            pass   # broadcast_have is called by PeerManager (see below)
 
     # --- Download ---
     manager = PeerManager(
@@ -329,6 +391,7 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         info_hash=torrent.info_hash,
         peer_id=peer_id,
         use_utp=True,   # BEP 29: fall back to uTP when TCP is blocked
+        on_piece_complete=(seeder.broadcast_have if seeder else None),
     )
 
     console.print()
@@ -353,29 +416,71 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
                 progress.update(task_id, completed=torrent.total_length)
                 live.update(_render())
     except RuntimeError as exc:
+        # Stop the seeder before returning the error.
+        if seeder_task is not None:
+            seeder_task.cancel()
+            try:
+                await seeder_task
+            except (asyncio.CancelledError, OSError):
+                pass
+        if seeder is not None:
+            await seeder.stop()
         console.print(f"\n[red]Download failed:[/red] {exc}")
         return 1
 
     console.print(f"\n[bold green]Done![/bold green] Saved to: {output_dir / torrent.name}")
 
+    # Tell trackers the download is complete.
+    await _announce_event(
+        torrent, peer_id, args.port, "completed",
+        downloaded=torrent.total_length,
+    )
+
     if not args.leech:
-        from bittorrent.seeder import Seeder
-        seeder = Seeder(
-            torrent, storage, pm,
-            info_hash=torrent.info_hash,
-            peer_id=peer_id,
-            port=args.port,
-        )
+        # The seeder is already running (started before download).
+        # Register signal handlers so Ctrl-C triggers a clean shutdown.
         console.print(
             f"\n[cyan]Seeding on port {args.port}[/cyan]  "
             f"(Ctrl-C to stop)"
         )
+        shutdown = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def _signal_handler() -> None:
+            console.print("\n[yellow]Shutting down…[/yellow]")
+            shutdown.set()
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _signal_handler)
+            except NotImplementedError:
+                pass  # Windows: signal handling not available in asyncio
+
         try:
-            await seeder.run()
-        except asyncio.CancelledError:
-            pass
+            # Wait for either the seeder task to finish (error) or a signal.
+            await asyncio.wait(
+                [seeder_task, asyncio.create_task(shutdown.wait())],
+                return_when=asyncio.FIRST_COMPLETED,
+            )
         finally:
+            seeder_task.cancel()
+            try:
+                await seeder_task
+            except (asyncio.CancelledError, OSError):
+                pass
             await seeder.stop()
+            # Remove signal handlers so the process can exit normally.
+            for sig in (signal.SIGINT, signal.SIGTERM):
+                try:
+                    loop.remove_signal_handler(sig)
+                except NotImplementedError:
+                    pass
+
+        # Tell trackers we're gone.
+        await _announce_event(
+            torrent, peer_id, args.port, "stopped",
+            downloaded=torrent.total_length,
+        )
 
     return 0
 

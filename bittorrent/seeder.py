@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 from typing import TYPE_CHECKING
 
 from bittorrent.peer import PeerConnection, PeerError
@@ -36,9 +37,10 @@ if TYPE_CHECKING:
 
 log = logging.getLogger(__name__)
 
-MAX_UPLOAD_SLOTS  = 4      # max simultaneous unchoked upload peers
-RECHOKE_INTERVAL  = 10.0   # seconds between rechoke passes
-KEEPALIVE_INTERVAL = 90.0  # seconds between keep-alives to upload peers
+MAX_UPLOAD_SLOTS          = 4     # max simultaneous unchoked upload peers
+RECHOKE_INTERVAL          = 10.0  # seconds between regular rechoke passes
+OPTIMISTIC_UNCHOKE_INTERVAL = 30.0  # seconds between optimistic unchoke passes
+KEEPALIVE_INTERVAL        = 90.0  # seconds between keep-alives to upload peers
 
 
 class Seeder:
@@ -83,16 +85,17 @@ class Seeder:
             self._handle_connection, "0.0.0.0", self._port
         )
         rechoke_task = asyncio.create_task(self._rechoke_loop())
+        optimistic_task = asyncio.create_task(self._optimistic_unchoke_loop())
         self._tasks.add(rechoke_task)
+        self._tasks.add(optimistic_task)
         try:
             async with self._server:
                 await self._server.serve_forever()
         finally:
-            rechoke_task.cancel()
-            try:
-                await rechoke_task
-            except asyncio.CancelledError:
-                pass
+            for t in (rechoke_task, optimistic_task):
+                t.cancel()
+            await asyncio.gather(rechoke_task, optimistic_task,
+                                 return_exceptions=True)
 
     async def stop(self) -> None:
         """Shut down the server and close all upload peer connections."""
@@ -158,9 +161,28 @@ class Seeder:
             await asyncio.sleep(RECHOKE_INTERVAL)
             self._rechoke()
 
+    async def _optimistic_unchoke_loop(self) -> None:
+        """Every OPTIMISTIC_UNCHOKE_INTERVAL seconds, unchoke one random choked peer.
+
+        This gives new or slow peers an upload slot they wouldn't normally get,
+        matching BEP 3's optimistic unchoke requirement.
+        """
+        while True:
+            await asyncio.sleep(OPTIMISTIC_UNCHOKE_INTERVAL)
+            self._do_optimistic_unchoke()
+
     def _rechoke(self) -> None:
-        """Unchoke up to MAX_UPLOAD_SLOTS interested peers; choke the rest."""
-        active = [p for p in self._peers if not p.closed and p.peer_interested]
+        """Unchoke up to MAX_UPLOAD_SLOTS interested peers; choke the rest.
+
+        Peers are ranked by bytes_sent (highest first) so that the fastest
+        consumers keep their slots — a simplified tit-for-tat for seeders.
+        """
+        active = [
+            p for p in self._peers
+            if not p.closed and p.peer_interested
+        ]
+        # Sort by bytes served descending; new peers (0 bytes) appear last
+        active.sort(key=lambda p: p.bytes_sent, reverse=True)
         for i, peer in enumerate(active):
             if i < MAX_UPLOAD_SLOTS:
                 if peer.am_choking:
@@ -168,6 +190,16 @@ class Seeder:
             else:
                 if not peer.am_choking:
                     asyncio.create_task(peer.send_choke_safe())
+
+    def _do_optimistic_unchoke(self) -> None:
+        """Unchoke one randomly-chosen choked-but-interested peer."""
+        choked_interested = [
+            p for p in self._peers
+            if not p.closed and p.peer_interested and p.am_choking
+        ]
+        if choked_interested:
+            peer = random.choice(choked_interested)
+            asyncio.create_task(peer.send_unchoke_safe())
 
 
 class _UploadPeer:
@@ -184,6 +216,7 @@ class _UploadPeer:
         self._pm      = piece_manager
         self._conn: PeerConnection | None = None
         self.closed: bool = False
+        self.bytes_sent: int = 0   # total bytes uploaded to this peer
 
     @property
     def am_choking(self) -> bool:
@@ -260,6 +293,7 @@ class _UploadPeer:
                 piece_data = self._storage.read_piece(piece_index)
                 block_data = piece_data[block_offset : block_offset + block_length]
                 await conn.send_piece_block(piece_index, block_offset, block_data)
+                self.bytes_sent += len(block_data)
                 log.debug(
                     "Served piece %d offset %d length %d to %s:%s",
                     piece_index, block_offset, block_length,

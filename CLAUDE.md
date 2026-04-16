@@ -90,12 +90,12 @@ tests/
 - [x] Multi-file torrent support with cross-file piece spanning
 - [x] Pre-allocation of all files before download
 
-### Phase 3 — Choking + performance
-- [ ] Tit-for-tat choke/unchoke (BEP 3)
-- [ ] Upload slots
-- [ ] Keep-alive messages (currently peers may time out on long stalls)
+### Phase 3 — Choking + performance ✓
+- [x] Tit-for-tat choke/unchoke (BEP 3) — rechoke every 10s by bytes_sent; optimistic unchoke every 30s
+- [x] Upload slots — MAX_UPLOAD_SLOTS=4 enforced in Seeder._rechoke()
+- [x] Keep-alive messages — keepalive loop every 90s in both download and upload peers
 
-### Phase 4 — Stretch goals
+### Phase 4 — Stretch goals ✓
 - [x] UDP tracker protocol (BEP 15)
 - [x] DHT peer discovery (BEP 5) — Kademlia bootstrap + iterative get_peers
 - [x] Magnet links (BEP 9 + BEP 10 extension protocol)
@@ -103,11 +103,14 @@ tests/
 - [x] Peer Exchange / PEX (BEP 11) — peers share peer lists via ut_pex extension
 - [x] uTP transport (BEP 29) — reliable delivery over UDP, TCP fallback
 - [x] Web seeds (BEP 19) — HTTP Range fetching from url-list servers
-- [ ] Seeding / uploading to peers
-- [ ] IPv6 peer support
-- [ ] HTTPS tracker support
+- [x] Seeding / uploading to peers — Seeder with tit-for-tat, HAVE broadcast, upload while downloading
+- [x] IPv6 peer support — peers6 compact format in tracker responses
+- [x] HTTPS tracker support — aiohttp handles TLS natively in announce()
+- [x] Tracker completed/stopped events — _announce_event() called after download/shutdown
+- [x] End-game CANCEL messages — CANCEL sent to losing peers in end-game mode
+- [x] Signal handling — SIGINT/SIGTERM → clean shutdown + stopped announce
 
-**640/640 tests passing.**
+**~700 tests passing.**
 
 ## Key BEP References
 
