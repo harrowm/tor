@@ -347,7 +347,7 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         done, total = pm.progress()
         line = Text()
         line.append(f"Pieces: {done}/{total}  ", style="cyan")
-        line.append(f"Peers: {_state['peers']}  ", style="magenta")
+        line.append(f"Peers: {manager.stats.peers_active}  ", style="magenta")
         line.append(f"Elapsed: {elapsed:.0f}s", style="dim")
         return line
 
@@ -420,9 +420,24 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
     try:
         with Live(_render(), console=console, refresh_per_second=4,
                   transient=False) as live:
+            _last_heartbeat = time.monotonic()
+            _last_pieces    = pm.progress()[0]
+
             async def _tick() -> None:
+                nonlocal _last_heartbeat, _last_pieces
                 while True:
                     live.update(_render())
+                    now = time.monotonic()
+                    if now - _last_heartbeat >= 30.0:
+                        done, total = pm.progress()
+                        if done == _last_pieces:
+                            log.warning(
+                                "No progress for 30s — %d/%d pieces, "
+                                "%d peers active",
+                                done, total, manager.stats.peers_active,
+                            )
+                        _last_heartbeat = now
+                        _last_pieces    = done
                     await asyncio.sleep(0.25)
 
             tick_task = asyncio.create_task(_tick())
@@ -516,7 +531,7 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
 
 def main() -> None:
     args    = _parse_args()
-    level   = logging.DEBUG if args.verbose else logging.WARNING
+    level   = logging.DEBUG if args.verbose else logging.INFO
     console = Console(stderr=True)
     logging.basicConfig(
         level=level,

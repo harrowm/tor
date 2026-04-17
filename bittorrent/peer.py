@@ -60,7 +60,7 @@ from bittorrent.messages import (
 
 log = logging.getLogger(__name__)
 
-BLOCK_TIMEOUT = 30.0  # seconds to wait for a single block response
+BLOCK_TIMEOUT = 10.0  # seconds to wait for a single block response
 
 
 class PeerError(Exception):
@@ -503,7 +503,7 @@ class PeerConnection:
         log.debug("Piece %d verified OK (%d bytes)", piece_index, len(piece_data))
         return piece_data
 
-    async def _wait_for_unchoke(self, timeout: float = 90.0) -> None:
+    async def _wait_for_unchoke(self, timeout: float = 30.0) -> None:
         """Read messages until UNCHOKE arrives (or timeout)."""
         async def _loop() -> None:
             while True:

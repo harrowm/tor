@@ -535,7 +535,7 @@ class TestWebSeedIntegration:
             remote_supports_extensions = False
             _pending = []
 
-            async def download_piece(self, idx, size, h):
+            async def download_piece(self, idx, size, h, **kwargs):
                 return pieces[idx]
 
             async def do_extension_handshake(self, *a, **kw): pass
