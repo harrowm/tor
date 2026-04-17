@@ -239,7 +239,13 @@ class PeerManager:
                 continue
 
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._storage.write_piece, piece_index, data)
+            try:
+                await loop.run_in_executor(None, self._storage.write_piece, piece_index, data)
+            except Exception as exc:
+                self._pm.mark_missing(piece_index)
+                log.debug("Web seed storage write failed for piece %d: %s", piece_index, exc)
+                await asyncio.sleep(1.0)
+                continue
             already_complete = self._pm.is_complete_piece(piece_index)
             self._pm.mark_complete(piece_index)
 
@@ -270,6 +276,7 @@ class PeerManager:
                 self._info_hash, self._peer_id,
                 timeout=CONNECT_TIMEOUT,
                 extension_protocol=True,
+                num_pieces=self._torrent.num_pieces,
             )
         except (PeerError, OSError) as exc:
             if not self._use_utp:
@@ -285,6 +292,7 @@ class PeerManager:
                 self._info_hash, self._peer_id,
                 timeout=CONNECT_TIMEOUT,
                 extension_protocol=True,
+                num_pieces=self._torrent.num_pieces,
             )
         except (PeerError, UTPError, OSError) as exc:
             log.debug("uTP to %s:%s also failed: %s", host, port, exc)
@@ -337,8 +345,9 @@ class PeerManager:
         ka_task = asyncio.create_task(_keepalive_loop())
         try:
             await self._download_loop(conn, on_progress, peer_queue)
+            log.info("Peer %s:%s: finished (no more pieces needed)", host, port)
         except (PeerError, OSError) as exc:
-            log.debug("Peer %s:%s error: %s", host, port, exc)
+            log.info("Peer %s:%s disconnected: %s", host, port, exc)
         finally:
             ka_task.cancel()
             try:
@@ -423,15 +432,34 @@ class PeerManager:
                     piece_index, piece_size, expected_hash,
                     completion_check=self._pm.is_complete_piece,
                 )
-            except PeerError as exc:
-                if "already complete" in str(exc):
+            except (PeerError, OSError) as exc:
+                self._pm.mark_missing(piece_index)
+                exc_str = str(exc)
+                if "already complete" in exc_str:
                     # End-game: another peer won the race; CANCEL was sent.
                     # Return the piece to MISSING so stats stay consistent,
                     # then continue looking for another piece to download.
-                    self._pm.mark_missing(piece_index)
                     continue
-                self._pm.mark_missing(piece_index)
-                raise  # let _download_from_peer log it and close connection
+                if "choked" in exc_str or "rejected" in exc_str:
+                    # Peer choked/rejected us — normal in tit-for-tat.
+                    # Wait for UNCHOKE (up to 30 s) then retry rather than
+                    # dropping the connection.  Most clients unchoke within 10–30 s.
+                    log.info(
+                        "Peer %s:%s choked us; waiting up to 30s for unchoke",
+                        conn.host, conn.port,
+                    )
+                    t0 = asyncio.get_event_loop().time()
+                    try:
+                        await conn._wait_for_unchoke(timeout=30.0)
+                    except PeerError:
+                        raise  # connection closed or timed out — give up on this peer
+                    log.info(
+                        "Peer %s:%s unchoked us after %.0fs",
+                        conn.host, conn.port,
+                        asyncio.get_event_loop().time() - t0,
+                    )
+                    continue  # unchoked — grab a fresh piece and keep going
+                raise  # other errors: disconnect
 
             # Process any PEX messages that arrived during the piece download
             self._drain_pex(conn, peer_queue)
@@ -442,7 +470,11 @@ class PeerManager:
             # idempotent.  The check→mark_complete pair below has no await
             # between them so the "already complete" stat is still counted once.
             loop = asyncio.get_event_loop()
-            await loop.run_in_executor(None, self._storage.write_piece, piece_index, data)
+            try:
+                await loop.run_in_executor(None, self._storage.write_piece, piece_index, data)
+            except Exception as exc:
+                self._pm.mark_missing(piece_index)
+                raise PeerError(f"Storage write failed for piece {piece_index}: {exc}") from exc
             already_complete = self._pm.is_complete_piece(piece_index)
             self._pm.mark_complete(piece_index)
 

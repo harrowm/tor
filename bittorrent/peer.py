@@ -107,6 +107,7 @@ class PeerConnection:
         *,
         timeout: float = 10.0,
         extension_protocol: bool = False,
+        num_pieces: int = 0,
     ) -> "PeerConnection":
         """Connect to *host*:*port* and complete the handshake.
 
@@ -116,10 +117,14 @@ class PeerConnection:
                                  ``conn.remote_supports_extensions`` afterwards,
                                  then call ``conn.do_extension_handshake()`` to
                                  negotiate specific extensions.
+            num_pieces:         Total number of pieces in the torrent.  Required
+                                 so that a BEP 6 HAVE_ALL message can be
+                                 converted to a full bitfield.
 
         Raises PeerError on connection failure or handshake mismatch.
         """
         conn = cls(host, port)
+        conn.num_pieces = num_pieces
         try:
             reader, writer = await asyncio.wait_for(
                 asyncio.open_connection(host, port),
@@ -157,6 +162,7 @@ class PeerConnection:
         *,
         timeout: float = 10.0,
         extension_protocol: bool = False,
+        num_pieces: int = 0,
     ) -> "PeerConnection":
         """Connect to *host*:*port* via uTP (BEP 29) and complete the handshake.
 
@@ -172,6 +178,7 @@ class PeerConnection:
             raise PeerError(f"uTP socket error connecting to {host}:{port}: {exc}") from exc
 
         conn = cls._from_streams(host, port, reader, writer)
+        conn.num_pieces = num_pieces
         await conn._handshake(info_hash, peer_id, extension_protocol=extension_protocol)
         return conn
 
@@ -356,9 +363,10 @@ class PeerConnection:
 
         # Tell the peer we're interested right away.  Seeders close idle
         # connections within a second or two of the handshake; delaying
-        # INTERESTED until download_piece() is called races that timeout.
-        if not extension_protocol:
-            await self._send_raw(encode_interested())
+        # INTERESTED until download_piece() is called means we wait the full
+        # extension-handshake round-trip before the peer even considers
+        # unchocking us.
+        await self._send_raw(encode_interested())
 
     async def _maybe_read_bitfield(self) -> None:
         """If the next message is a BITFIELD/HAVE_ALL/HAVE_NONE, read and store it.
@@ -428,7 +436,9 @@ class PeerConnection:
         # download_piece() is called we may already be unchoked.
         if self.am_choked:
             await self._send_raw(encode_interested())
+            log.info("Waiting for unchoke from %s:%s", self.host, self.port)
             await self._wait_for_unchoke()
+            log.info("Unchoked by %s:%s", self.host, self.port)
 
         # Calculate block spans for this piece
         blocks = _block_spans(piece_length)
@@ -469,9 +479,10 @@ class PeerConnection:
                 self.am_choked = True
                 raise PeerError(f"Peer choked us while downloading piece {piece_index}")
             elif msg.msg_id == MSG_REJECT_REQUEST:
-                # BEP 6: peer explicitly declined our request — treat as choke
+                # BEP 6: peer explicitly declined this specific request.
+                # Treat it like a choke so the caller can wait for unchoke.
                 raise PeerError(
-                    f"Peer rejected our request for piece {piece_index}"
+                    f"Peer rejected request for piece {piece_index} (BEP 6)"
                 )
             elif msg.msg_id == MSG_EXTENDED:
                 # Buffer extended messages (e.g. PEX) for processing between pieces
@@ -492,7 +503,7 @@ class PeerConnection:
         log.debug("Piece %d verified OK (%d bytes)", piece_index, len(piece_data))
         return piece_data
 
-    async def _wait_for_unchoke(self, timeout: float = 30.0) -> None:
+    async def _wait_for_unchoke(self, timeout: float = 90.0) -> None:
         """Read messages until UNCHOKE arrives (or timeout)."""
         async def _loop() -> None:
             while True:
@@ -526,7 +537,7 @@ class PeerConnection:
             return self._pending.pop(0)
         try:
             return await read_message(self._reader)
-        except EOFError as exc:
+        except (EOFError, OSError) as exc:
             raise PeerError(f"Connection to {self.host}:{self.port} closed: {exc}") from exc
 
     def _apply_have(self, msg: PeerMessage) -> None:
@@ -611,6 +622,11 @@ class PeerConnection:
                     return
                 elif msg.msg_id == MSG_BITFIELD:
                     self.bitfield = bytearray(msg.payload)
+                elif msg.msg_id == MSG_UNCHOKE:
+                    # Peer unchocked us during extension handshake — apply now.
+                    self.am_choked = False
+                elif msg.msg_id == MSG_CHOKE:
+                    self.am_choked = True
                 else:
                     deferred.append(msg)
         finally:
