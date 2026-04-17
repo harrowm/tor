@@ -345,9 +345,10 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
     def _make_status() -> Text:
         elapsed = time.monotonic() - _state["t_start"]
         done, total = pm.progress()
+        peers = _state["peers"]   # updated in on_progress on each piece completion
         line = Text()
         line.append(f"Pieces: {done}/{total}  ", style="cyan")
-        line.append(f"Peers: {manager.stats.peers_active}  ", style="magenta")
+        line.append(f"Peers: {peers}  ", style="magenta")
         line.append(f"Elapsed: {elapsed:.0f}s", style="dim")
         return line
 
@@ -356,6 +357,17 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         fracs    = pm.piece_fractions(_map_width)
         map_text = _piece_map(fracs, _map_width)
         return RGroup(progress, _make_status(), Text(""), map_text)
+
+    class _LiveRenderable:
+        """Re-evaluates _render() on every Rich refresh tick.
+
+        Rich's Live context stores a single renderable snapshot.  By wrapping
+        _render() in __rich_console__ we force a fresh call on every display
+        refresh (4× per second) so elapsed time, piece count, and peer count
+        stay current without needing live.update() from an asyncio task.
+        """
+        def __rich_console__(self, console, options):
+            yield _render()
 
     # --- Seeder (started early so we can serve pieces during download) ---
     # The seeder runs the entire time — even before download completes it can
@@ -418,7 +430,7 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
 
     console.print()
     try:
-        with Live(_render(), console=console, refresh_per_second=4,
+        with Live(_LiveRenderable(), console=console, refresh_per_second=4,
                   transient=False) as live:
             _last_heartbeat = time.monotonic()
             _last_pieces    = pm.progress()[0]
@@ -426,7 +438,6 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
             async def _tick() -> None:
                 nonlocal _last_heartbeat, _last_pieces
                 while True:
-                    live.update(_render())
                     now = time.monotonic()
                     if now - _last_heartbeat >= 30.0:
                         done, total = pm.progress()
@@ -434,7 +445,7 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
                             log.warning(
                                 "No progress for 30s — %d/%d pieces, "
                                 "%d peers active",
-                                done, total, manager.stats.peers_active,
+                                done, total, _state["peers"],
                             )
                         _last_heartbeat = now
                         _last_pieces    = done
