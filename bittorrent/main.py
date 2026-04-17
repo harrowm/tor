@@ -443,7 +443,27 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
             tick_task = asyncio.create_task(_tick())
             try:
                 all_peers = list(peers) + lsd_discovered
-                await manager.run(all_peers, on_progress=on_progress, allocate=False)
+
+                async def _reannounce(*, downloaded: int, left: int):
+                    """Fetch fresh peers from all trackers + DHT and return them."""
+                    from dataclasses import dataclass as _dc
+
+                    @_dc
+                    class _Resp:
+                        peers: list
+
+                    new_peers = await _announce_all(torrent, peer_id, args.port, console)
+                    dht_fresh = await _dht_peers(torrent.info_hash, console, timeout=30.0)
+                    combined = list({tuple(p) for p in new_peers + dht_fresh})
+                    return _Resp(peers=combined)
+
+                await manager.run(
+                    all_peers,
+                    on_progress=on_progress,
+                    allocate=False,
+                    reannounce=_reannounce,
+                    reannounce_interval=300,   # re-announce every 5 minutes
+                )
             finally:
                 tick_task.cancel()
                 try:
