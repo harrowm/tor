@@ -13,6 +13,7 @@ import argparse
 import asyncio
 import logging
 import signal
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -41,6 +42,21 @@ from bittorrent.seeder import Seeder
 from bittorrent.storage import Storage
 from bittorrent.torrent import ParseError, load
 from bittorrent.tracker import TrackerError, announce, generate_peer_id
+
+def _git_short_hash() -> str:
+    """Return the short git commit hash of the current HEAD, or 'unknown'."""
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            capture_output=True, text=True,
+            cwd=Path(__file__).parent.parent,
+        )
+        if result.returncode == 0:
+            return result.stdout.strip()
+    except OSError:
+        pass
+    return "unknown"
+
 
 # Characters used to render the piece map (low → high completion)
 _MAP_CHARS = " ░▒▓█"
@@ -284,7 +300,12 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         return 1
 
     # --- Set up storage and piece tracking ---
-    output_dir = Path(args.output_dir).resolve()
+    # Each run goes into its own subdirectory named after the git commit so
+    # successive test runs don't clobber each other (and resume scanning
+    # doesn't confuse partial data from different code versions).
+    git_hash = _git_short_hash()
+    output_dir = Path(args.output_dir).resolve() / git_hash
+    log.info("Output directory: %s (git %s)", output_dir, git_hash)
     storage    = Storage(torrent, output_dir)
     pm         = PieceManager(
         torrent.num_pieces,
@@ -358,17 +379,6 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
         map_text = _piece_map(fracs, _map_width)
         return RGroup(progress, _make_status(), Text(""), map_text)
 
-    class _LiveRenderable:
-        """Re-evaluates _render() on every Rich refresh tick.
-
-        Rich's Live context stores a single renderable snapshot.  By wrapping
-        _render() in __rich_console__ we force a fresh call on every display
-        refresh (4× per second) so elapsed time, piece count, and peer count
-        stay current without needing live.update() from an asyncio task.
-        """
-        def __rich_console__(self, console, options):
-            yield _render()
-
     # --- Seeder (started early so we can serve pieces during download) ---
     # The seeder runs the entire time — even before download completes it can
     # serve pieces we've already verified to other leechers in the swarm.
@@ -430,7 +440,7 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
 
     console.print()
     try:
-        with Live(_LiveRenderable(), console=console, refresh_per_second=4,
+        with Live(_render(), console=console, refresh_per_second=4,
                   transient=False) as live:
             _last_heartbeat = time.monotonic()
             _last_pieces    = pm.progress()[0]
@@ -439,6 +449,10 @@ async def _run(args: argparse.Namespace, console: Console | None = None) -> int:
                 nonlocal _last_heartbeat, _last_pieces
                 while True:
                     now = time.monotonic()
+                    try:
+                        live.update(_render())
+                    except Exception as exc:
+                        log.debug("live.update error: %s", exc)
                     if now - _last_heartbeat >= 30.0:
                         done, total = pm.progress()
                         if done == _last_pieces:

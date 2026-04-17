@@ -15,11 +15,14 @@ needed later.
 from __future__ import annotations
 
 import hashlib
+import logging
 import os
 from dataclasses import dataclass
 from pathlib import Path
 
 from bittorrent.torrent import Torrent
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,6 +80,7 @@ class Storage:
                 f"Piece {piece_index}: expected {piece_len} bytes, got {len(data)}"
             )
         self._write_bytes(piece_start, data)
+        log.info("DISK WRITE piece %d: %d bytes at offset %d", piece_index, len(data), piece_start)
 
     def read_piece(self, piece_index: int) -> bytes:
         """Read back the bytes for *piece_index* from disk."""

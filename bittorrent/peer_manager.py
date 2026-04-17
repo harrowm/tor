@@ -426,6 +426,7 @@ class PeerManager:
         consuming its peer just before another peer's in-flight piece fails and
         returns to MISSING — which would leave no worker alive to pick it up.
         """
+        choke_retries = 0
         while not self._pm.is_complete():
             # If the peer sent no BITFIELD, treat as "can serve any piece"
             # (common for seeders that skip BITFIELD and just answer requests).
@@ -449,25 +450,29 @@ class PeerManager:
                     piece_index, piece_size, expected_hash,
                     completion_check=self._pm.is_complete_piece,
                 )
+                choke_retries = 0  # reset on any successful piece
             except (PeerError, OSError) as exc:
                 self._pm.mark_missing(piece_index)
                 exc_str = str(exc)
                 if "already complete" in exc_str:
                     # End-game: another peer won the race; CANCEL was sent.
-                    # Return the piece to MISSING so stats stay consistent,
-                    # then continue looking for another piece to download.
                     continue
                 if "choked" in exc_str or "rejected" in exc_str:
-                    # Peer choked/rejected us — normal in tit-for-tat.
-                    # Wait for UNCHOKE (up to 30 s) then retry rather than
-                    # dropping the connection.  Most clients unchoke within 10–30 s.
+                    choke_retries += 1
+                    if choke_retries >= 3:
+                        # Persistently choky peer — give up and move on.
+                        log.info(
+                            "Peer %s:%s choked us %d times; giving up",
+                            conn.host, conn.port, choke_retries,
+                        )
+                        raise
                     log.info(
-                        "Peer %s:%s choked us; waiting up to 30s for unchoke",
-                        conn.host, conn.port,
+                        "Peer %s:%s choked us (%d/3); waiting up to 15s for unchoke",
+                        conn.host, conn.port, choke_retries,
                     )
                     t0 = asyncio.get_event_loop().time()
                     try:
-                        await conn._wait_for_unchoke(timeout=30.0)
+                        await conn._wait_for_unchoke(timeout=15.0)
                     except PeerError:
                         raise  # connection closed or timed out — give up on this peer
                     log.info(
@@ -475,7 +480,7 @@ class PeerManager:
                         conn.host, conn.port,
                         asyncio.get_event_loop().time() - t0,
                     )
-                    continue  # unchoked — grab a fresh piece and keep going
+                    continue
                 raise  # other errors: disconnect
 
             # Process any PEX messages that arrived during the piece download
