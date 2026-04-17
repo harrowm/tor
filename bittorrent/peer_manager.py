@@ -219,6 +219,14 @@ class PeerManager:
         """
         from bittorrent.webseed import WebSeedClient
 
+        # Exit after this many consecutive failures so the worker doesn't loop
+        # forever if the web seed can't serve a particular piece.  next_piece(None)
+        # always re-selects the lowest-index MISSING piece, so a single
+        # persistently-failing piece would otherwise keep the task alive
+        # indefinitely, blocking the run() loop from ever completing.
+        _consecutive_failures = 0
+        _MAX_CONSECUTIVE_FAILURES = 5
+
         while not self._pm.is_complete():
             # Ask for any missing piece (no bitfield restriction — HTTP serves all)
             piece_index = self._pm.next_piece(None)
@@ -232,8 +240,17 @@ class PeerManager:
 
             try:
                 data = await client.fetch_piece(session, piece_index)
+                _consecutive_failures = 0   # reset on any success
             except WebSeedError as exc:
                 self._pm.mark_missing(piece_index)
+                _consecutive_failures += 1
+                if _consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+                    log.info(
+                        "Web seed %s: %d consecutive failures, stopping "
+                        "(peers will handle remaining pieces)",
+                        client._base_url, _consecutive_failures,
+                    )
+                    return
                 log.debug("Web seed error on piece %d: %s", piece_index, exc)
                 await asyncio.sleep(1.0)   # back off briefly before retrying
                 continue
